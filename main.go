@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const version = "0.4"
+const version = "0.0.1"
 const githubAPI = "https://api.github.com/repos/ron7/passmut/releases/latest"
 
 // Config holds all the configuration options
