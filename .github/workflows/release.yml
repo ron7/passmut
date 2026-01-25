@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Releases
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Get tag name
+        id: tag
+        run: echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build Linux (amd64) binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o passmut-linux-amd64 main.go
+
+      - name: Build Alpine (amd64) binary
+        run: |
+          # Static binary compatible with Alpine (musl libc)
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o passmut-alpine-amd64 main.go
+
+      - name: Create Linux release archive
+        run: |
+          tar -czf passmut-linux-amd64.tar.gz passmut-linux-amd64
+          sha256sum passmut-linux-amd64.tar.gz > passmut-linux-amd64.tar.gz.sha256
+
+      - name: Create Alpine release archive
+        run: |
+          tar -czf passmut-alpine-amd64.tar.gz passmut-alpine-amd64
+          sha256sum passmut-alpine-amd64.tar.gz > passmut-alpine-amd64.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            passmut-linux-amd64.tar.gz
+            passmut-linux-amd64.tar.gz.sha256
+            passmut-alpine-amd64.tar.gz
+            passmut-alpine-amd64.tar.gz.sha256
+          name: Release ${{ steps.tag.outputs.TAG_NAME }}
+          body: |
+            ## Release ${{ steps.tag.outputs.TAG_NAME }}
+            
+            ### Linux (amd64)
+            - **Binary**: `passmut-linux-amd64.tar.gz`
+            - **SHA256**: See `passmut-linux-amd64.tar.gz.sha256`
+            
+            ### Alpine Linux (amd64)
+            - **Binary**: `passmut-alpine-amd64.tar.gz`
+            - **SHA256**: See `passmut-alpine-amd64.tar.gz.sha256`
+            
+            ### Installation (Linux)
+            ```bash
+            tar -xzf passmut-linux-amd64.tar.gz
+            chmod +x passmut-linux-amd64
+            sudo mv passmut-linux-amd64 /usr/local/bin/passmut
+            ```
+            
+            ### Installation (Alpine)
+            ```bash
+            tar -xzf passmut-alpine-amd64.tar.gz
+            chmod +x passmut-alpine-amd64
+            sudo mv passmut-alpine-amd64 /usr/local/bin/passmut
+            ```
+            
+            ### Changes
+            See [CHANGELOG](https://github.com/ron7/passmut/blob/main/CHANGELOG.md) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
