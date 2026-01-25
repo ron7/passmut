@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,47 +26,47 @@ const githubAPI = "https://api.github.com/repos/ron7/passmut/releases/latest"
 
 // Config holds all the configuration options
 type Config struct {
-	inputFile        string
-	outputFile       string
-	minLength        int
-	maxLength        int
-	perms            bool
-	double           bool
-	reverse          bool
-	leet             bool
-	fullLeet         bool
-	allCases         bool
-	capital          bool
-	upper            bool
-	lower            bool
-	swap             bool
-	prefixStrings    string
-	suffixStrings    string
-	punctuation      bool
-	yearsCount       string // range string
-	acronym          bool
-	common           string
-	prefixRange      string
-	suffixRange      string
-	space            bool
-	analyze          bool
-	crunchFilter     string
-	sortMode         string // "", "a", "e"
-	mutationLevel    int    // 0, 1, 2
-	helpLong         bool   // Extensive help
-	minStrength      int    // 0-4 score
-	passphraseCount  int    // Number of words to combine
-	passphraseSep    string // Separator for passphrases
-	noNumbers        bool
-	noSymbols        bool
-	noCapitals       bool
-	threads          int    // Max goroutines
-	rulesList        string // Comma separated rules for sequencing
-	excludeCommon    string // Path to common passwords file
-	checkUpdates     bool
-	upgrade          bool
-	showVersion      bool
-	Rules            []string // Ordered list of rules to apply
+	inputFile       string
+	outputFile      string
+	minLength       int
+	maxLength       int
+	perms           bool
+	double          bool
+	reverse         bool
+	leet            bool
+	fullLeet        bool
+	allCases        bool
+	capital         bool
+	upper           bool
+	lower           bool
+	swap            bool
+	prefixStrings   string
+	suffixStrings   string
+	punctuation     bool
+	yearsCount      string // range string
+	acronym         bool
+	common          string
+	prefixRange     string
+	suffixRange     string
+	space           bool
+	analyze         bool
+	crunchFilter    string
+	sortMode        string // "", "a", "e"
+	mutationLevel   int    // 0, 1, 2
+	helpLong        bool   // Extensive help
+	minStrength     int    // 0-4 score
+	passphraseCount int    // Number of words to combine
+	passphraseSep   string // Separator for passphrases
+	noNumbers       bool
+	noSymbols       bool
+	noCapitals      bool
+	threads         int    // Max goroutines
+	rulesList       string // Comma separated rules for sequencing
+	excludeCommon   string // Path to common passwords file
+	checkUpdates    bool
+	upgrade         bool
+	showVersion     bool
+	Rules           []string // Ordered list of rules to apply
 }
 
 // ruleFlag is a custom flag type that appends the rule name to the config's Rules list
@@ -194,15 +196,21 @@ func main() {
 }
 
 func checkForUpdates() {
+	currentVersion := "v" + version
+	
+	// Always show local version first
+	fmt.Printf("Local ver:  %s\n", currentVersion)
+
+	var latestVersion string
 	resp, err := http.Get(githubAPI)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
+		fmt.Printf("Remote ver: Error checking for updates: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Error checking for updates: HTTP %d\n", resp.StatusCode)
+		fmt.Printf("Remote ver: Error checking for updates: HTTP %d\n", resp.StatusCode)
 		return
 	}
 
@@ -210,19 +218,38 @@ func checkForUpdates() {
 		TagName string `json:"tag_name"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing update info: %v\n", err)
+		fmt.Printf("Remote ver: Error parsing update info: %v\n", err)
 		return
 	}
 
 	if release.TagName == "" {
-		fmt.Fprintf(os.Stderr, "Error: no release information found\n")
+		fmt.Printf("Remote ver: Error: no release information found\n")
 		return
 	}
 
-	if release.TagName != "v"+version {
-		fmt.Printf("A new version (%s) is available. Run with --upgrade to update.\n", release.TagName)
+	latestVersion = release.TagName
+	fmt.Printf("Remote ver: %s\n", latestVersion)
+
+	if latestVersion != currentVersion {
+		fmt.Printf("\nA new version is available.\n")
+		fmt.Printf("Do you want to upgrade now? [y/N]: ")
+		
+		reader := bufio.NewReader(os.Stdin)
+		response, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nError reading input: %v\n", err)
+			return
+		}
+		
+		response = strings.TrimSpace(strings.ToLower(response))
+		if response == "y" || response == "yes" {
+			fmt.Println()
+			upgradeTool()
+		} else {
+			fmt.Println("Upgrade cancelled.")
+		}
 	} else {
-		fmt.Println("You are using the latest version.")
+		fmt.Printf("\nYou are using the latest version.\n")
 	}
 }
 
@@ -241,7 +268,8 @@ func upgradeTool() {
 	}
 
 	var release struct {
-		Assets []struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
 			BrowserDownloadURL string `json:"browser_download_url"`
 			Name               string `json:"name"`
 		} `json:"assets"`
@@ -251,18 +279,155 @@ func upgradeTool() {
 		return
 	}
 
+	if release.TagName == "" {
+		fmt.Fprintf(os.Stderr, "Error: no release tag found\n")
+		return
+	}
+
+	// Determine which binary to download (prefer Alpine, fallback to Linux)
+	var downloadURL string
+	var assetName string
 	for _, asset := range release.Assets {
-		if strings.Contains(asset.Name, "passmut") {
-			fmt.Printf("Downloading %s...\n", asset.Name)
-			// For simplicity and matching PassMute.py, we use curl to replace the binary
-			// In a real go app we might use selfupdate packages
-			cmd := fmt.Sprintf("curl -L -o %s %s && chmod +x %s", os.Args[0], asset.BrowserDownloadURL, os.Args[0])
-			fmt.Printf("Executing: %s\n", cmd)
-			// Note: This is a destructive action on the binary
-			return
+		if strings.Contains(asset.Name, "alpine") && strings.HasSuffix(asset.Name, ".tar.gz") {
+			downloadURL = asset.BrowserDownloadURL
+			assetName = asset.Name
+			break
 		}
 	}
-	fmt.Println("No matching assets found in the latest release.")
+	// Fallback to Linux if Alpine not found
+	if downloadURL == "" {
+		for _, asset := range release.Assets {
+			if strings.Contains(asset.Name, "linux") && strings.HasSuffix(asset.Name, ".tar.gz") {
+				downloadURL = asset.BrowserDownloadURL
+				assetName = asset.Name
+				break
+			}
+		}
+	}
+
+	if downloadURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: no suitable release asset found\n")
+		return
+	}
+
+	fmt.Printf("Downloading %s...\n", assetName)
+
+	// Download the archive
+	resp, err = http.Get(downloadURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error downloading: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "Error downloading: HTTP %d\n", resp.StatusCode)
+		return
+	}
+
+	// Create temporary file for the archive
+	tmpArchive, err := os.CreateTemp("", "passmut-upgrade-*.tar.gz")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating temp file: %v\n", err)
+		return
+	}
+	defer os.Remove(tmpArchive.Name())
+	defer tmpArchive.Close()
+
+	// Download to temp file
+	_, err = io.Copy(tmpArchive, resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing archive: %v\n", err)
+		return
+	}
+	tmpArchive.Close()
+
+	// Extract the binary from the archive
+	tmpArchive, err = os.Open(tmpArchive.Name())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reopening archive: %v\n", err)
+		return
+	}
+	defer tmpArchive.Close()
+
+	gzReader, err := gzip.NewReader(tmpArchive)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading gzip: %v\n", err)
+		return
+	}
+	defer gzReader.Close()
+
+	tarReader := tar.NewReader(gzReader)
+	var binaryData []byte
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading tar: %v\n", err)
+			return
+		}
+
+		// Look for the binary file (passmut-linux-amd64 or passmut-alpine-amd64)
+		if header.Typeflag == tar.TypeReg && (strings.Contains(header.Name, "passmut") && !strings.Contains(header.Name, ".tar.gz") && !strings.Contains(header.Name, ".sha256")) {
+			binaryData, err = io.ReadAll(tarReader)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading binary: %v\n", err)
+				return
+			}
+			break
+		}
+	}
+
+	if len(binaryData) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: binary not found in archive\n")
+		return
+	}
+
+	// Get the current binary path
+	currentBinary := os.Args[0]
+	absPath, err := filepath.Abs(currentBinary)
+	if err != nil {
+		absPath = currentBinary
+	}
+
+	// Create temporary file for new binary
+	tmpBinary, err := os.CreateTemp(filepath.Dir(absPath), "passmut-new-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating temp binary: %v\n", err)
+		return
+	}
+	tmpBinaryPath := tmpBinary.Name()
+
+	// Write new binary
+	_, err = tmpBinary.Write(binaryData)
+	if err != nil {
+		tmpBinary.Close()
+		os.Remove(tmpBinaryPath)
+		fmt.Fprintf(os.Stderr, "Error writing binary: %v\n", err)
+		return
+	}
+	tmpBinary.Close()
+
+	// Make executable
+	err = os.Chmod(tmpBinaryPath, 0755)
+	if err != nil {
+		os.Remove(tmpBinaryPath)
+		fmt.Fprintf(os.Stderr, "Error setting permissions: %v\n", err)
+		return
+	}
+
+	// Replace the old binary
+	err = os.Rename(tmpBinaryPath, absPath)
+	if err != nil {
+		os.Remove(tmpBinaryPath)
+		fmt.Fprintf(os.Stderr, "Error replacing binary: %v\n", err)
+		fmt.Fprintf(os.Stderr, "You may need to run with sudo or replace manually\n")
+		return
+	}
+
+	fmt.Printf("Successfully upgraded to %s\n", release.TagName)
 }
 
 func parseFlags(args []string) *Config {
@@ -344,7 +509,6 @@ func parseFlags(args []string) *Config {
 	return config
 }
 
-
 func showUsage() {
 	y := "\033[33m" // Yellow for parameters
 	b := "\033[1m"  // Bold for values
@@ -396,10 +560,6 @@ func showUsage() {
 	fmt.Fprintf(os.Stderr, "\t%s--no-symbols%s: exclude words with symbols\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--no-capitals%s: exclude words with capitals\n", y, r)
 }
-
-
-
-
 
 func showLongUsage() {
 	y := "\033[33m"
@@ -504,7 +664,6 @@ func showLongUsage() {
 	fmt.Fprintf(os.Stderr, "  %s--upgrade%s           Perform a self-upgrade.\n", y, r)
 }
 
-
 func run(config *Config, inputPaths []string) error {
 	var allWords []string
 	for _, p := range inputPaths {
@@ -607,7 +766,6 @@ func loadBlacklist(path string) (map[string]struct{}, error) {
 	return bl, scanner.Err()
 }
 
-
 func loadWords(r io.Reader) ([]string, error) {
 	var words []string
 	scanner := bufio.NewScanner(r)
@@ -624,7 +782,9 @@ func (m *Mangler) process(words []string) error {
 	// If common words enabled, add them to the base words list so they become components
 	if m.config.common != "" {
 		tempMap := make(map[string]struct{})
-		for _, w := range words { tempMap[w] = struct{}{} }
+		for _, w := range words {
+			tempMap[w] = struct{}{}
+		}
 		for _, cw := range m.currentCommon {
 			if _, exists := tempMap[cw]; !exists {
 				words = append(words, cw)
@@ -659,7 +819,7 @@ func (m *Mangler) process(words []string) error {
 	// Multithreaded worker loop
 	jobs := make(chan string, 100)
 	var wg sync.WaitGroup
-	
+
 	worker := func() {
 		defer wg.Done()
 		for word := range jobs {
@@ -673,8 +833,10 @@ func (m *Mangler) process(words []string) error {
 
 	// Start workers
 	threadCount := m.config.threads
-	if threadCount < 1 { threadCount = 1 }
-	
+	if threadCount < 1 {
+		threadCount = 1
+	}
+
 	for i := 0; i < threadCount; i++ {
 		wg.Add(1)
 		go worker()
@@ -703,7 +865,9 @@ func (m *Mangler) process(words []string) error {
 			sort.Slice(m.collectedResults, func(i, j int) bool {
 				si := getWordEfficacy(m.collectedResults[i])
 				sj := getWordEfficacy(m.collectedResults[j])
-				if si == sj { return m.collectedResults[i] < m.collectedResults[j] }
+				if si == sj {
+					return m.collectedResults[i] < m.collectedResults[j]
+				}
 				return si > sj
 			})
 		}
@@ -713,7 +877,6 @@ func (m *Mangler) process(words []string) error {
 	}
 	return nil
 }
-
 
 func (m *Mangler) generateCombinedPassphrases(pool []string) error {
 	if len(pool) == 0 {
@@ -737,7 +900,9 @@ func (m *Mangler) generateCombinedPassphrases(pool []string) error {
 				time.Sleep(1 * time.Nanosecond)
 			}
 			var parts []string
-			for _, idx := range indices { parts = append(parts, pool[idx]) }
+			for _, idx := range indices {
+				parts = append(parts, pool[idx])
+			}
 			m.writeWord(strings.Join(parts, m.config.passphraseSep))
 		}
 	}
@@ -775,12 +940,24 @@ func (m *Mangler) mangleWord(word string) {
 
 	res := make(map[string]struct{})
 	res[word] = struct{}{}
-	if m.config.double { res[word+word] = struct{}{} }
-	if m.config.reverse { res[reverseString(word)] = struct{}{} }
-	if m.config.capital { res[capitalize(word)] = struct{}{} }
-	if m.config.lower { res[strings.ToLower(word)] = struct{}{} }
-	if m.config.upper { res[strings.ToUpper(word)] = struct{}{} }
-	if m.config.swap { res[swapCase(word)] = struct{}{} }
+	if m.config.double {
+		res[word+word] = struct{}{}
+	}
+	if m.config.reverse {
+		res[reverseString(word)] = struct{}{}
+	}
+	if m.config.capital {
+		res[capitalize(word)] = struct{}{}
+	}
+	if m.config.lower {
+		res[strings.ToLower(word)] = struct{}{}
+	}
+	if m.config.upper {
+		res[strings.ToUpper(word)] = struct{}{}
+	}
+	if m.config.swap {
+		res[swapCase(word)] = struct{}{}
+	}
 	if m.config.prefixStrings != "" {
 		for _, s := range strings.Split(m.config.prefixStrings, ",") {
 			res[strings.TrimSpace(s)+word] = struct{}{}
@@ -798,7 +975,9 @@ func (m *Mangler) mangleWord(word string) {
 		}
 	}
 	if m.config.fullLeet {
-		for _, v := range generateFullLeetVariations(word) { res[v] = struct{}{} }
+		for _, v := range generateFullLeetVariations(word) {
+			res[v] = struct{}{}
+		}
 	} else if m.config.leet {
 		allSwapped := word
 		for char, reps := range leetMap {
@@ -811,17 +990,25 @@ func (m *Mangler) mangleWord(word string) {
 		res[allSwapped] = struct{}{}
 	}
 	if m.config.allCases {
-		for _, v := range generateAllCasePermutations(word) { res[v] = struct{}{} }
+		for _, v := range generateAllCasePermutations(word) {
+			res[v] = struct{}{}
+		}
 	}
 	if m.config.punctuation {
-		for _, p := range "!@$%^&*()" { res[word+string(p)] = struct{}{} }
+		for _, p := range "!@$%^&*()" {
+			res[word+string(p)] = struct{}{}
+		}
 	}
 	if m.config.yearsCount != "" {
 		m.addNumberRange(word, m.config.yearsCount, true, res)
 		m.addNumberRange(word, m.config.yearsCount, false, res)
 	}
-	if m.config.prefixRange != "" { m.addNumberRange(word, m.config.prefixRange, true, res) }
-	if m.config.suffixRange != "" { m.addNumberRange(word, m.config.suffixRange, false, res) }
+	if m.config.prefixRange != "" {
+		m.addNumberRange(word, m.config.prefixRange, true, res)
+	}
+	if m.config.suffixRange != "" {
+		m.addNumberRange(word, m.config.suffixRange, false, res)
+	}
 
 	for w := range res {
 		m.writeWord(w)
@@ -871,26 +1058,38 @@ func (m *Mangler) applySequence(word string) {
 	}
 }
 
-
-
 func (m *Mangler) writeWord(word string) {
-	if m.config.minLength > 0 && len(word) < m.config.minLength { return }
-	if m.config.maxLength > 0 && len(word) > m.config.maxLength { return }
-	
+	if m.config.minLength > 0 && len(word) < m.config.minLength {
+		return
+	}
+	if m.config.maxLength > 0 && len(word) > m.config.maxLength {
+		return
+	}
+
 	// Exclusion Filters
 	if m.config.noNumbers || m.config.noSymbols || m.config.noCapitals {
 		for _, r := range word {
-			if m.config.noNumbers && r >= '0' && r <= '9' { return }
-			if m.config.noCapitals && r >= 'A' && r <= 'Z' { return }
-			if m.config.noSymbols && !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) { return }
+			if m.config.noNumbers && r >= '0' && r <= '9' {
+				return
+			}
+			if m.config.noCapitals && r >= 'A' && r <= 'Z' {
+				return
+			}
+			if m.config.noSymbols && !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+				return
+			}
 		}
 	}
 
-	if m.config.crunchFilter != "" && !m.matchesCrunch(word) { return }
-	
+	if m.config.crunchFilter != "" && !m.matchesCrunch(word) {
+		return
+	}
+
 	// Blacklist Check
 	if m.blacklistedWords != nil {
-		if _, exists := m.blacklistedWords[word]; exists { return }
+		if _, exists := m.blacklistedWords[word]; exists {
+			return
+		}
 	}
 
 	// Strength Filter
@@ -910,7 +1109,9 @@ func (m *Mangler) writeWord(word string) {
 	}
 
 	crc := crc32.ChecksumIEEE([]byte(word))
-	if _, exists := m.seenCRCs[crc]; exists { return }
+	if _, exists := m.seenCRCs[crc]; exists {
+		return
+	}
 	m.seenCRCs[crc] = struct{}{}
 	if m.config.sortMode != "" {
 		m.collectedResults = append(m.collectedResults, word)
@@ -919,10 +1120,10 @@ func (m *Mangler) writeWord(word string) {
 	m.bufWriter.WriteString(word + "\n")
 }
 
-
-
 func calculateStrength(s string) int {
-	if len(s) == 0 { return 0 }
+	if len(s) == 0 {
+		return 0
+	}
 	score := 0
 
 	// Criteria based on common complexity standards
@@ -932,16 +1133,32 @@ func calculateStrength(s string) int {
 	hasSpec := false
 
 	for _, r := range s {
-		if r >= 'a' && r <= 'z' { hasLower = true }
-		if r >= 'A' && r <= 'Z' { hasUpper = true }
-		if r >= '0' && r <= '9' { hasNumber = true }
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) { hasSpec = true }
+		if r >= 'a' && r <= 'z' {
+			hasLower = true
+		}
+		if r >= 'A' && r <= 'Z' {
+			hasUpper = true
+		}
+		if r >= '0' && r <= '9' {
+			hasNumber = true
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			hasSpec = true
+		}
 	}
 
-	if hasLower { score++ }
-	if hasUpper { score++ }
-	if hasNumber { score++ }
-	if hasSpec { score++ }
+	if hasLower {
+		score++
+	}
+	if hasUpper {
+		score++
+	}
+	if hasNumber {
+		score++
+	}
+	if hasSpec {
+		score++
+	}
 
 	// Length bonus
 	if len(s) < 8 {
@@ -955,24 +1172,45 @@ func calculateStrength(s string) int {
 		score++
 	}
 
-	if score < 0 { score = 0 }
-	if score > 4 { score = 4 }
+	if score < 0 {
+		score = 0
+	}
+	if score > 4 {
+		score = 4
+	}
 	return score
 }
 
-
 func (m *Mangler) matchesCrunch(s string) bool {
 	f := m.config.crunchFilter
-	if len(s) != len(f) { return false }
+	if len(s) != len(f) {
+		return false
+	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch f[i] {
-		case '.': continue
-		case '#': if c < '0' || c > '9' { return false }
-		case '^': if c < 'A' || c > 'Z' { return false }
-		case '%': if c < 'a' || c > 'z' { return false }
-		case '&': if (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') { return false }
-		default: if c != f[i] { return false }
+		case '.':
+			continue
+		case '#':
+			if c < '0' || c > '9' {
+				return false
+			}
+		case '^':
+			if c < 'A' || c > 'Z' {
+				return false
+			}
+		case '%':
+			if c < 'a' || c > 'z' {
+				return false
+			}
+		case '&':
+			if (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+				return false
+			}
+		default:
+			if c != f[i] {
+				return false
+			}
 		}
 	}
 	return true
@@ -980,10 +1218,14 @@ func (m *Mangler) matchesCrunch(s string) bool {
 
 func (m *Mangler) addNumberRange(word string, r string, prefix bool, res map[string]struct{}) {
 	parts := strings.Split(r, "-")
-	if len(parts) != 2 { return }
+	if len(parts) != 2 {
+		return
+	}
 	cur := time.Now().Year()
 	parse := func(s string) int {
-		if strings.ToLower(strings.TrimSpace(s)) == "current" { return cur }
+		if strings.ToLower(strings.TrimSpace(s)) == "current" {
+			return cur
+		}
 		var v int
 		fmt.Sscanf(s, "%d", &v)
 		return v
@@ -991,17 +1233,25 @@ func (m *Mangler) addNumberRange(word string, r string, prefix bool, res map[str
 	sVal, eVal := parse(parts[0]), parse(parts[1])
 	pad := len(strings.TrimSpace(parts[0]))
 	fmtStr := "%d"
-	if strings.HasPrefix(strings.TrimSpace(parts[0]), "0") || (pad > 1 && sVal < 10) { fmtStr = fmt.Sprintf("%%0%dd", pad) }
+	if strings.HasPrefix(strings.TrimSpace(parts[0]), "0") || (pad > 1 && sVal < 10) {
+		fmtStr = fmt.Sprintf("%%0%dd", pad)
+	}
 	for i := sVal; i <= eVal; i++ {
 		ns := fmt.Sprintf(fmtStr, i)
-		if prefix { res[ns+word] = struct{}{} } else { res[word+ns] = struct{}{} }
+		if prefix {
+			res[ns+word] = struct{}{}
+		} else {
+			res[word+ns] = struct{}{}
+		}
 	}
 }
 
 func (m *Mangler) generatePermutations(words []string) []string {
 	var res []string
 	sep := ""
-	if m.config.space { sep = " " }
+	if m.config.space {
+		sep = " "
+	}
 	for l := 1; l <= len(words); l++ {
 		m.permuteHelper(words, l, []string{}, &res, sep)
 	}
@@ -1017,25 +1267,40 @@ func (m *Mangler) permuteHelper(words []string, l int, cur []string, res *[]stri
 	}
 	for i := 0; i < len(words); i++ {
 		used := false
-		for _, w := range cur { if w == words[i] { used = true; break } }
-		if !used { m.permuteHelper(words, l, append(cur, words[i]), res, sep) }
+		for _, w := range cur {
+			if w == words[i] {
+				used = true
+				break
+			}
+		}
+		if !used {
+			m.permuteHelper(words, l, append(cur, words[i]), res, sep)
+		}
 	}
 }
 
 func generateAcronym(words []string) string {
 	var b strings.Builder
-	for _, w := range words { if len(w) > 0 { b.WriteByte(w[0]) } }
+	for _, w := range words {
+		if len(w) > 0 {
+			b.WriteByte(w[0])
+		}
+	}
 	return b.String()
 }
 
 func reverseString(s string) string {
 	r := []rune(s)
-	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 { r[i], r[j] = r[j], r[i] }
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
 	return string(r)
 }
 
 func capitalize(s string) string {
-	if len(s) == 0 { return s }
+	if len(s) == 0 {
+		return s
+	}
 	r := []rune(s)
 	r[0] = []rune(strings.ToUpper(string(r[0])))[0]
 	return string(r)
@@ -1044,7 +1309,13 @@ func capitalize(s string) string {
 func swapCase(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r >= 'a' && r <= 'z' { b.WriteRune(r - 32) } else if r >= 'A' && r <= 'Z' { b.WriteRune(r + 32) } else { b.WriteRune(r) }
+		if r >= 'a' && r <= 'z' {
+			b.WriteRune(r - 32)
+		} else if r >= 'A' && r <= 'Z' {
+			b.WriteRune(r + 32)
+		} else {
+			b.WriteRune(r)
+		}
 	}
 	return b.String()
 }
@@ -1052,15 +1323,24 @@ func swapCase(s string) string {
 func generateFullLeetVariations(word string) []string {
 	lw := strings.ToLower(word)
 	var sbs []substitution
-	for i, r := range lw { if rps, ok := leetMap[r]; ok { sbs = append(sbs, substitution{i, rps}) } }
-	if len(sbs) == 0 { return []string{word} }
+	for i, r := range lw {
+		if rps, ok := leetMap[r]; ok {
+			sbs = append(sbs, substitution{i, rps})
+		}
+	}
+	if len(sbs) == 0 {
+		return []string{word}
+	}
 	var res []string
 	generateLeetCombinations([]rune(word), sbs, 0, &res)
 	return res
 }
 
 func generateLeetCombinations(w []rune, sbs []substitution, idx int, res *[]string) {
-	if idx == len(sbs) { *res = append(*res, string(w)); return }
+	if idx == len(sbs) {
+		*res = append(*res, string(w))
+		return
+	}
 	sb := sbs[idx]
 	orig := w[sb.pos]
 	generateLeetCombinations(w, sbs, idx+1, res)
@@ -1075,12 +1355,12 @@ func generateAllCasePermutations(word string) []string {
 	var results []string
 	n := len(word)
 	max := 1 << n
-	
+
 	// Pre-calculate lower and upper runes to avoid repeated calls
 	runes := []rune(word)
 	lowers := make([]rune, n)
 	uppers := make([]rune, n)
-	
+
 	for i, r := range runes {
 		lowers[i] = []rune(strings.ToLower(string(r)))[0]
 		uppers[i] = []rune(strings.ToUpper(string(r)))[0]
@@ -1089,7 +1369,7 @@ func generateAllCasePermutations(word string) []string {
 	for i := 0; i < max; i++ {
 		current := make([]rune, n)
 		for j := 0; j < n; j++ {
-			if (i >> j) & 1 == 1 {
+			if (i>>j)&1 == 1 {
 				current[j] = uppers[j]
 			} else {
 				current[j] = lowers[j]
@@ -1101,8 +1381,13 @@ func generateAllCasePermutations(word string) []string {
 }
 
 func getWordEfficacy(s string) float64 {
-	w := 1.0; l := len(s)
-	if v, ok := lengthChances[l]; ok { w *= v } else if l > 24 { w *= 0.0001 }
+	w := 1.0
+	l := len(s)
+	if v, ok := lengthChances[l]; ok {
+		w *= v
+	} else if l > 24 {
+		w *= 0.0001
+	}
 
 	combo := 0
 	hasLower, hasUpper, hasNumber, hasSpec := false, false, false, false
@@ -1115,29 +1400,67 @@ func getWordEfficacy(s string) float64 {
 		isNum := r >= '0' && r <= '9'
 		isSpec := !isLower && !isUpper && !isNum
 
-		if isLower { hasLower = true; allUpper = false; onlyNumbers = false }
-		if isUpper { hasUpper = true; allLower = false; onlyNumbers = false; if i == 0 { firstUpper = true } }
-		if isNum { hasNumber = true; allLower = false; allUpper = false }
-		if isSpec { hasSpec = true; allLower = false; allUpper = false; onlyNumbers = false }
+		if isLower {
+			hasLower = true
+			allUpper = false
+			onlyNumbers = false
+		}
+		if isUpper {
+			hasUpper = true
+			allLower = false
+			onlyNumbers = false
+			if i == 0 {
+				firstUpper = true
+			}
+		}
+		if isNum {
+			hasNumber = true
+			allLower = false
+			allUpper = false
+		}
+		if isSpec {
+			hasSpec = true
+			allLower = false
+			allUpper = false
+			onlyNumbers = false
+		}
 	}
 
-	if hasLower && allLower { combo |= MaskAllLower }
-	if hasUpper && allUpper { combo |= MaskAllUpper }
-	if hasLower { combo |= MaskHasLower }
-	if hasUpper { combo |= MaskHasUpper }
-	if hasNumber { combo |= MaskHasNumber }
-	if hasSpec { combo |= MaskHasSpec }
-	if onlyNumbers && hasNumber { combo |= MaskOnlyNumbers }
+	if hasLower && allLower {
+		combo |= MaskAllLower
+	}
+	if hasUpper && allUpper {
+		combo |= MaskAllUpper
+	}
+	if hasLower {
+		combo |= MaskHasLower
+	}
+	if hasUpper {
+		combo |= MaskHasUpper
+	}
+	if hasNumber {
+		combo |= MaskHasNumber
+	}
+	if hasSpec {
+		combo |= MaskHasSpec
+	}
+	if onlyNumbers && hasNumber {
+		combo |= MaskOnlyNumbers
+	}
 	if firstUpper && len(s) > 1 {
 		// Check second char is not upper
 		r2 := []rune(s)[1]
-		if !(r2 >= 'A' && r2 <= 'Z') { combo |= MaskFirstUpper }
+		if !(r2 >= 'A' && r2 <= 'Z') {
+			combo |= MaskFirstUpper
+		}
 	}
 
 	// Suffix checks
 	if len(s) > 0 {
 		last := s[len(s)-1]
-		if last >= '0' && last <= '9' { combo |= MaskEndsInNumber }
+		if last >= '0' && last <= '9' {
+			combo |= MaskEndsInNumber
+		}
 		if !((last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') || (last >= '0' && last <= '9')) {
 			combo |= MaskEndsInSpec
 		}
@@ -1148,20 +1471,34 @@ func getWordEfficacy(s string) float64 {
 		combo |= MaskLeet
 	}
 
-	if v, ok := comboChances[combo]; ok { w *= v } else { w *= 0.0001 }
+	if v, ok := comboChances[combo]; ok {
+		w *= v
+	} else {
+		w *= 0.0001
+	}
 	return w
 }
 func analyzeWordlist(words []string) {
-	total := len(words); var n, sp, u, l int; lens := make(map[int]int)
+	total := len(words)
+	var n, sp, u, l int
+	lens := make(map[int]int)
 	strengths := make(map[int]int)
 	var totalScore int
 
 	rn, rs, ru, rl := regexp.MustCompile(`[0-9]`), regexp.MustCompile(`[^A-Za-z0-9]`), regexp.MustCompile(`[A-Z]`), regexp.MustCompile(`[a-z]`)
 	for _, w := range words {
-		if rn.MatchString(w) { n++ }
-		if rs.MatchString(w) { sp++ }
-		if ru.MatchString(w) { u++ }
-		if rl.MatchString(w) { l++ }
+		if rn.MatchString(w) {
+			n++
+		}
+		if rs.MatchString(w) {
+			sp++
+		}
+		if ru.MatchString(w) {
+			u++
+		}
+		if rl.MatchString(w) {
+			l++
+		}
 		lens[len(w)]++
 
 		s := calculateStrength(w)
@@ -1183,20 +1520,44 @@ func analyzeWordlist(words []string) {
 }
 
 func printASCIIChart(lens map[int]int, total int) {
-	if total == 0 { return }
-	ks := make([]int, 0, len(lens)); for k := range lens { ks = append(ks, k) }; sort.Ints(ks)
-	mv := 0; for _, v := range lens { if v > mv { mv = v } }
+	if total == 0 {
+		return
+	}
+	ks := make([]int, 0, len(lens))
+	for k := range lens {
+		ks = append(ks, k)
+	}
+	sort.Ints(ks)
+	mv := 0
+	for _, v := range lens {
+		if v > mv {
+			mv = v
+		}
+	}
 	for _, k := range ks {
-		v := lens[k]; bl := (v * 40) / mv
-		if bl == 0 && v > 0 { bl = 1 }
+		v := lens[k]
+		bl := (v * 40) / mv
+		if bl == 0 && v > 0 {
+			bl = 1
+		}
 		fmt.Printf("%2d [%6d] %s\n", k, v, strings.Repeat("█", bl))
 	}
 }
 
 const (
-	MaskAllUpper = 1; MaskFirstUpper = 2; MaskAllLower = 4; MaskHasUpper = 16; MaskHasLower = 8
-	MaskEndsInNumber = 32; MaskEndsInSpec = 64; MaskLeet = 128; MaskHasNumber = 256; MaskHasSpec = 512; MaskOnlyNumbers = 1024
+	MaskAllUpper     = 1
+	MaskFirstUpper   = 2
+	MaskAllLower     = 4
+	MaskHasUpper     = 16
+	MaskHasLower     = 8
+	MaskEndsInNumber = 32
+	MaskEndsInSpec   = 64
+	MaskLeet         = 128
+	MaskHasNumber    = 256
+	MaskHasSpec      = 512
+	MaskOnlyNumbers  = 1024
 )
+
 var lengthChances = map[int]float64{
 	1: 0.00034, 2: 0.0023, 3: 0.017, 4: 0.127, 5: 1.81, 6: 13.58, 7: 17.47, 8: 20.68,
 	9: 15.27, 10: 14.04, 11: 6.03, 12: 3.86, 13: 2.53, 14: 1.73, 15: 1.12, 16: 0.82,
