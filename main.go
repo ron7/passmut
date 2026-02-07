@@ -197,7 +197,7 @@ func main() {
 
 func checkForUpdates() {
 	currentVersion := "v" + version
-	
+
 	// Always show local version first
 	fmt.Printf("Local ver:  %s\n", currentVersion)
 
@@ -233,14 +233,14 @@ func checkForUpdates() {
 	if latestVersion != currentVersion {
 		fmt.Printf("\nA new version is available.\n")
 		fmt.Printf("Do you want to upgrade now? [y/N]: ")
-		
+
 		reader := bufio.NewReader(os.Stdin)
 		response, err := reader.ReadString('\n')
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\nError reading input: %v\n", err)
 			return
 		}
-		
+
 		response = strings.TrimSpace(strings.ToLower(response))
 		if response == "y" || response == "yes" {
 			fmt.Println()
@@ -536,19 +536,19 @@ func showUsage() {
 	fmt.Fprintf(os.Stderr, "\t%s-n%s, %s--threads%s %s<N>%s: number of goroutines\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s-p%s, %s--perms%s: permutate all the words\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-pp%s, %s--passphrase%s %s<N>%s: generate passphrases\n", y, r, y, r, b, r)
-	fmt.Fprintf(os.Stderr, "\t%s-pr%s, %s--prefix-range%s %s<R>%s: add range of numbers to the beginning\n", y, r, y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\t%s-pr%s, %s--prefix-range%s %s<R>%s: add range of numbers to the beginning [01-99]\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s-ps%s, %s--prefix-strings%s %s<S>%s: add strings to the start (comma-separated)\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s-r%s, %s--reverse%s: reverse the word\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-s%s, %s--swap%s: swap the case of the word\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-S%s, %s--sort%s %s<M>%s: sort mode: %s'a'%s for alpha, %s'e'%s for efficacy\n", y, r, y, r, b, r, b, r, b, r)
-	fmt.Fprintf(os.Stderr, "\t%s-sr%s, %s--suffix-range%s %s<R>%s: add range of numbers to the end\n", y, r, y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\t%s-sr%s, %s--suffix-range%s %s<R>%s: add range of numbers to the end [100-999]\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s-ss%s, %s--suffix-strings%s %s<S>%s: add strings to the end (comma-separated)\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s-t%s, %s--leet%s: l33t speak the word\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-T%s, %s--full-leet%s: all possibilities l33t\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-u%s, %s--upper%s: uppercase the word\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-v%s: show version\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-x%s, %s--max%s %s<N>%s: maximum word length\n", y, r, y, r, b, r)
-	fmt.Fprintf(os.Stderr, "\t%s-y%s, %s--years%s: add range of years\n", y, r, y, r)
+	fmt.Fprintf(os.Stderr, "\t%s-y%s, %s--years%s: add range of years [1980-2020]\n", y, r, y, r)
 	// Long-only options
 	fmt.Fprintf(os.Stderr, "\t%s--rules%s %s<operators>%s: custom recipe (e.g. %s-r,-u,-t%s)\n", y, r, b, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s--exclude-common%s %s<file>%s: blacklist file\n", y, r, b, r)
@@ -559,7 +559,21 @@ func showUsage() {
 	fmt.Fprintf(os.Stderr, "\t%s--no-numbers%s: exclude words with numbers\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--no-symbols%s: exclude words with symbols\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--no-capitals%s: exclude words with capitals\n", y, r)
+	//fmt.Fprintf(os.Stderr, "\t%s  %s\n", renderTogglePill(false), renderTogglePill(true))
 }
+
+// renderTogglePill returns a pill-shaped toggle indicator
+// OFF: gray circle (◯), ON: green filled circle (●)
+// func renderTogglePill(isOn bool) string {
+// 	gray := "\033[90m"   // Bright black (gray)
+// 	green := "\033[32m"  // Green
+// 	reset := "\033[0m"   // Reset
+// 	if isOn {
+// 		return fmt.Sprintf("%s●%s", green, reset)
+// 	} else {
+// 		return fmt.Sprintf("%s◯%s", gray, reset)
+// 	}
+// }
 
 func showLongUsage() {
 	y := "\033[33m"
