@@ -41,8 +41,12 @@ version: build-dev
 help: build-dev
 	./$(BINARY_NAME) -h
 
-# Run all checks (fmt, vet)
-all: fmt vet build
+# Run unit tests
+test:
+	go test -v ./...
+
+# Run all checks (fmt, vet, test)
+all: fmt vet test build
 
 # Cross-compilation targets
 build-linux:
