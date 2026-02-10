@@ -67,6 +67,10 @@ type Config struct {
 	upgrade         bool
 	showVersion     bool
 	Rules           []string // Ordered list of rules to apply
+	seedWords       string
+	keyboardWalks   bool
+	smartAffix      bool
+	toggleVariations bool
 }
 
 // ruleFlag is a custom flag type that appends the rule name to the config's Rules list
@@ -92,15 +96,32 @@ func (f *ruleFlag) IsBoolFlag() bool {
 
 // LeetMap defines character substitutions for leet speak
 var leetMap = map[rune][]rune{
-	's': {'$', 'z'},
-	'e': {'3'},
-	'a': {'4', '@'},
-	'o': {'0'},
-	'i': {'1', '!'},
-	'l': {'1', '!'},
-	't': {'7'},
-	'b': {'8'},
-	'z': {'2'},
+	'a': {'4', '@', '^'},
+	'b': {'8', '6'},
+	'c': {'(', '<', '[', '{'},
+	'd': {'|', ')', '?'},
+	'e': {'3', '&'},
+	'f': {'|'},
+	'g': {'9', '6', '&'},
+	'h': {'#', '4'},
+	'i': {'1', '!', '|'},
+	'j': {'|', ';'},
+	'k': {'<', '|', '{'},
+	'l': {'1', '!', '|'},
+	'm': {'|', 'v', 'M'},
+	'n': {'^', '~'},
+	'o': {'0', '*'},
+	'p': {'|', '*'},
+	'q': {'9', '0'},
+	'r': {'2'},
+	's': {'5', '$', 'z'},
+	't': {'7', '+'},
+	'u': {'v'},
+	'v': {'\\', '/', '^'},
+	'w': {'v'},
+	'x': {'%', '×'},
+	'y': {'j'},
+	'z': {'2', '%', '7'},
 }
 
 // CommonWords to append/prepend
@@ -505,6 +526,11 @@ func parseFlags(args []string) *Config {
 	fs.BoolVar(&config.checkUpdates, "check-updates", false, "check for updates")
 	fs.BoolVar(&config.upgrade, "upgrade", false, "perform self-upgrade")
 
+	fs.StringVar(&config.seedWords, "seed", "", "comma-separated seed words")
+	fs.BoolVar(&config.keyboardWalks, "walks", false, "add common keyboard walks")
+	fs.BoolVar(&config.smartAffix, "smart-affix", false, "add smart affixes (years, 123, symbols)")
+	fs.BoolVar(&config.toggleVariations, "toggle-variations", false, "add toggle case permutations")
+
 	fs.Parse(args)
 	return config
 }
@@ -545,6 +571,10 @@ func showUsage() {
 	fmt.Fprintf(os.Stderr, "\t%s-ss%s, %s--suffix-strings%s %s<S>%s: add strings to the end (comma-separated)\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s-t%s, %s--leet%s: l33t speak the word\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-T%s, %s--full-leet%s: all possibilities l33t\n", y, r, y, r)
+	fmt.Fprintf(os.Stderr, "\t%s--seed%s %s<words>%s: inject seed words (comma-separated)\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\t%s--walks%s: add common keyboard walks\n", y, r)
+	fmt.Fprintf(os.Stderr, "\t%s--smart-affix%s: add smart affixes (years, 123, symbols)\n", y, r)
+	fmt.Fprintf(os.Stderr, "\t%s--toggle-variations%s: add toggle case permutations\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-u%s, %s--upper%s: uppercase the word\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-v%s: show version\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s-x%s, %s--max%s %s<N>%s: maximum word length\n", y, r, y, r, b, r)
@@ -645,12 +675,17 @@ func showLongUsage() {
 	fmt.Fprintf(os.Stderr, "  %s-ac%s, %s--all-cases%s    Generate all case permutations (warning: huge output).\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "  %s-d%s, %s--double%s        Append word to itself.\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "  %s-A%s, %s--acronym%s       Create acronyms from input words.\n", y, r, y, r)
-	fmt.Fprintf(os.Stderr, "  %s--space%s             Add spaces between words (for permutations).\n\n", y, r)
+	fmt.Fprintf(os.Stderr, "  %s--space%s             Add spaces between words (for permutations).\n", y, r)
+	fmt.Fprintf(os.Stderr, "  %s--seed%s %s<words>%s      Inject seed words (comma-separated).\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "  %s--walks%s             Add common keyboard walks.\n", y, r)
+	fmt.Fprintf(os.Stderr, "  %s--toggle-variations%s Add toggle case permutations.\n\n", y, r)
 
 	// TEXT MANIPULATION (APPEND/PREPEND)
 	fmt.Fprintf(os.Stderr, "TEXT MANIPULATION (APPEND/PREPEND):\n")
 	fmt.Fprintf(os.Stderr, "  %s-C%s, %s--common%s %s[file]%s\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\tAdd common words (admin, sys, etc) or load from file.\n")
+	fmt.Fprintf(os.Stderr, "  %s--smart-affix%s\n", y, r)
+	fmt.Fprintf(os.Stderr, "\tAdd smart affixes (years, 123, symbols).\n")
 	fmt.Fprintf(os.Stderr, "  %s-ps%s, %s--prefix-strings%s %s<S>%s\n", y, r, y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\tAdd comma-separated strings to the start of each word.\n")
 	fmt.Fprintf(os.Stderr, "  %s-ss%s, %s--suffix-strings%s %s<S>%s\n", y, r, y, r, b, r)
@@ -701,6 +736,20 @@ func run(config *Config, inputPaths []string) error {
 		if err == nil {
 			allWords = append(allWords, words...)
 		}
+	}
+
+	if config.seedWords != "" {
+		seeds := strings.Split(config.seedWords, ",")
+		for _, s := range seeds {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				allWords = append(allWords, s)
+			}
+		}
+	}
+
+	if config.keyboardWalks {
+		allWords = append(allWords, getKeyboardWalks()...)
 	}
 
 	if len(allWords) == 0 {
@@ -1011,6 +1060,14 @@ func (m *Mangler) mangleWord(word string) {
 	if m.config.punctuation {
 		for _, p := range "!@$%^&*()" {
 			res[word+string(p)] = struct{}{}
+		}
+	}
+	if m.config.smartAffix {
+		m.addSmartAffixes(word, res)
+	}
+	if m.config.toggleVariations {
+		for _, v := range generateToggleVariations(word) {
+			res[v] = struct{}{}
 		}
 	}
 	if m.config.yearsCount != "" {
@@ -1580,5 +1637,102 @@ var lengthChances = map[int]float64{
 var comboChances = map[int]float64{
 	16: 0.78, 4: 0.76, 20: 0.76, 256: 0.49, 272: 0.29, 260: 0.29, 276: 0.29,
 	32: 0.28, 288: 0.28, 48: 0.27, 304: 0.27, 36: 0.27, 52: 0.27, 292: 0.27,
-	1024: 0.19, 1280: 0.19, 8: 0.03, 1: 0.02, 9: 0.02, 128: 0.019,
+	1024: 0.19, 1280: 0.19, 8: 0.03, 1: 0.02, 9: 0.02, 	128: 0.019,
+}
+
+func getKeyboardWalks() []string {
+	return []string{
+		"qwerty", "asdfgh", "zxcvbn", "123456", "qazwsx",
+		"qwer", "asdf", "zxcv", "1234", "1qaz", "zaq1",
+		"wsx", "edc", "rfv", "tgb", "yhn", "ujm", "ik,", "ol.", "p;/",
+		"plm", "okn", "ijb", "uhv", "ygc", "tfx", "rdz", "esz", "waq",
+		"!@#$", "!@#$%", "qwertyuiop", "asdfghjkl", "zxcvbnm",
+	}
+}
+
+func (m *Mangler) addSmartAffixes(word string, res map[string]struct{}) {
+	// Years: current and past 5
+	cur := time.Now().Year()
+	for i := 0; i <= 5; i++ {
+		y := cur - i
+		ys := fmt.Sprintf("%d", y)
+		res[word+ys] = struct{}{}
+		res[ys+word] = struct{}{}
+		// Short year
+		if len(ys) >= 4 {
+			sys := ys[2:]
+			res[word+sys] = struct{}{}
+			res[sys+word] = struct{}{}
+		}
+	}
+
+	// 123 variations
+	seqs := []string{"1", "12", "123", "1234", "12345", "123456", "0", "01", "012"}
+	for _, s := range seqs {
+		res[word+s] = struct{}{}
+		res[s+word] = struct{}{}
+	}
+
+	// Common symbols
+	syms := []string{"!", ".", "?", "*", "#", "@", "$"}
+	for _, s := range syms {
+		res[word+s] = struct{}{}
+		res[s+word] = struct{}{}
+	}
+}
+
+func generateToggleVariations(word string) []string {
+	if len(word) == 0 {
+		return nil
+	}
+	var res []string
+
+	// Toggle first char
+	runes := []rune(word)
+	if len(runes) > 0 {
+		r0 := runes[0]
+		if r0 >= 'a' && r0 <= 'z' {
+			runes[0] = r0 - 32
+		} else if r0 >= 'A' && r0 <= 'Z' {
+			runes[0] = r0 + 32
+		}
+		res = append(res, string(runes))
+	}
+
+	// Toggle last char
+	runes = []rune(word)
+	if len(runes) > 0 {
+		last := len(runes) - 1
+		rl := runes[last]
+		if rl >= 'a' && rl <= 'z' {
+			runes[last] = rl - 32
+		} else if rl >= 'A' && rl <= 'Z' {
+			runes[last] = rl + 32
+		}
+		res = append(res, string(runes))
+	}
+
+	// Alternating case 1: aBcD
+	runes = []rune(word)
+	for i := range runes {
+		if i%2 == 0 {
+			runes[i] = []rune(strings.ToLower(string(runes[i])))[0]
+		} else {
+			runes[i] = []rune(strings.ToUpper(string(runes[i])))[0]
+		}
+	}
+	res = append(res, string(runes))
+
+	// Alternating case 2: AbCd
+	runes = []rune(word)
+	for i := range runes {
+		if i%2 != 0 {
+			runes[i] = []rune(strings.ToLower(string(runes[i])))[0]
+		} else {
+			runes[i] = []rune(strings.ToUpper(string(runes[i])))[0]
+		}
+	}
+	res = append(res, string(runes))
+
+	return res
 }
