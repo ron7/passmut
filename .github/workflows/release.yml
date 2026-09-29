@@ -19,20 +19,27 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: 'go.mod'
+          check-latest: true
 
       - name: Get tag name
         id: tag
-        run: echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Build Linux (amd64) binary
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o passmut-linux-amd64 main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-s -w -X main.version=${{ steps.tag.outputs.VERSION }}" \
+            -o passmut-linux-amd64 main.go
 
       - name: Build Alpine (amd64) binary
         run: |
           # Static binary compatible with Alpine (musl libc)
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o passmut-alpine-amd64 main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-s -w -X main.version=${{ steps.tag.outputs.VERSION }}" \
+            -o passmut-alpine-amd64 main.go
 
       - name: Create Linux release archive
         run: |

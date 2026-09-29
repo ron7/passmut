@@ -1,3 +1,10 @@
 /passmut
 /test_params
 /test_words.txt
+
+# Cross-compiled release artifacts (make build-all)
+/passmut-linux-amd64
+/passmut-windows-amd64.exe
+/passmut-darwin-amd64
+/passmut-darwin-arm64
+*.tar.gz

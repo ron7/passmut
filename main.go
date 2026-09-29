@@ -4,73 +4,94 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
-const version = "0.0.2"
+// version is overridden at build time with -X main.version=... (see the
+// Makefile and .github/workflows/release.yml). It must stay a var so release
+// binaries report the actual git tag instead of a stale hardcoded value.
+var version = "0.0.2"
+
 const githubAPI = "https://api.github.com/repos/ron7/passmut/releases/latest"
+
+// httpClient is used for all outbound HTTP calls so that neither the update
+// check nor the self-upgrade can hang forever on a stalled connection.
+var httpClient = &http.Client{Timeout: 60 * time.Second}
+
+// defaultMaxResults bounds how many results are buffered in memory (sort mode,
+// passphrase pool) and how many permutations / full-leet / case variants are
+// generated. Override with --max-results; 0 means unlimited.
+const defaultMaxResults = 5_000_000
 
 // Config holds all the configuration options
 type Config struct {
-	inputFile       string
-	outputFile      string
-	minLength       int
-	maxLength       int
-	perms           bool
-	double          bool
-	reverse         bool
-	leet            bool
-	fullLeet        bool
-	allCases        bool
-	capital         bool
-	upper           bool
-	lower           bool
-	swap            bool
-	prefixStrings   string
-	suffixStrings   string
-	punctuation     bool
-	yearsCount      string // range string
-	acronym         bool
-	common          string
-	prefixRange     string
-	suffixRange     string
-	space           bool
-	analyze         bool
-	crunchFilter    string
-	sortMode        string // "", "a", "e"
-	mutationLevel   int    // 0, 1, 2
-	helpLong        bool   // Extensive help
-	minStrength     int    // 0-4 score
-	passphraseCount int    // Number of words to combine
-	passphraseSep   string // Separator for passphrases
-	noNumbers       bool
-	noSymbols       bool
-	noCapitals      bool
-	threads         int    // Max goroutines
-	rulesList       string // Comma separated rules for sequencing
-	excludeCommon   string // Path to common passwords file
-	checkUpdates    bool
-	upgrade         bool
-	showVersion     bool
-	Rules           []string // Ordered list of rules to apply
-	seedWords       string
-	keyboardWalks   bool
-	smartAffix      bool
+	inputFile        string
+	outputFile       string
+	minLength        int
+	maxLength        int
+	perms            bool
+	double           bool
+	reverse          bool
+	leet             bool
+	fullLeet         bool
+	allCases         bool
+	capital          bool
+	upper            bool
+	lower            bool
+	swap             bool
+	prefixStrings    string
+	suffixStrings    string
+	punctuation      bool
+	yearsCount       string // range string
+	acronym          bool
+	common           string
+	prefixRange      string
+	suffixRange      string
+	space            bool
+	analyze          bool
+	crunchFilter     string
+	sortMode         string // "", "a", "e"
+	mutationLevel    int    // 0, 1, 2
+	helpLong         bool   // Extensive help
+	minStrength      int    // 0-4 score
+	passphraseCount  int    // Number of words to combine
+	passphraseSep    string // Separator for passphrases
+	noNumbers        bool
+	noSymbols        bool
+	noCapitals       bool
+	threads          int    // Max goroutines
+	rulesList        string // Comma separated rules for sequencing
+	excludeCommon    string // Path to common passwords file
+	checkUpdates     bool
+	upgrade          bool
+	showVersion      bool
+	Rules            []string // Ordered list of rules to apply
+	seedWords        string
+	keyboardWalks    bool
+	smartAffix       bool
 	toggleVariations bool
+	maxResults       int   // cap on buffered/generated results (0 = unlimited)
+	noDedup          bool  // disable global output de-duplication
+	ppCount          int   // number of random passphrases to generate
+	ppSeed           int64 // seed for reproducible passphrase generation (0 = random)
 }
 
 // ruleFlag is a custom flag type that appends the rule name to the config's Rules list
@@ -127,6 +148,9 @@ var leetMap = map[rune][]rune{
 // CommonWords to append/prepend
 var commonWords = []string{"pw", "pwd", "admin", "sys"}
 
+// punctuationSuffixes is the fixed set appended by --punctuation.
+var punctuationSuffixes = []string{"!", "@", "$", "%", "^", "&", "*", "(", ")"}
+
 // substitution represents a leet speak substitution at a specific position
 type substitution struct {
 	pos   int
@@ -136,13 +160,34 @@ type substitution struct {
 // Mangler handles the word mangling operations
 type Mangler struct {
 	config           *Config
-	output           io.Writer
-	seenCRCs         map[uint32]struct{}
+	seenHashes       map[uint64]struct{}
 	collectedResults []string
 	blacklistedWords map[string]struct{}
 	currentCommon    []string
 	bufWriter        *bufio.Writer
 	mu               sync.Mutex
+	limitOnce        sync.Once
+	// Parsed once from the config so the hot per-word path never re-splits
+	// comma-separated option strings.
+	prefixList []string
+	suffixList []string
+	ruleList   []string
+}
+
+// splitComma splits a comma-separated option string once, trimming whitespace
+// and dropping empty entries.
+func splitComma(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func main() {
@@ -190,7 +235,7 @@ func main() {
 	}
 
 	if config.upgrade {
-		upgradeTool()
+		upgradeTool(nil)
 		os.Exit(0)
 	}
 
@@ -216,42 +261,56 @@ func main() {
 	}
 }
 
+// releaseAsset and releaseInfo model the subset of the GitHub release payload
+// we need.
+type releaseAsset struct {
+	BrowserDownloadURL string `json:"browser_download_url"`
+	Name               string `json:"name"`
+}
+
+type releaseInfo struct {
+	TagName string         `json:"tag_name"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+// fetchLatestRelease fetches and parses the latest GitHub release. It is shared
+// by --check-updates and --upgrade so the release JSON is fetched only once per
+// run.
+func fetchLatestRelease() (*releaseInfo, error) {
+	resp, err := httpClient.Get(githubAPI)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d - repository or release not found", resp.StatusCode)
+	}
+	var rel releaseInfo
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, fmt.Errorf("parsing update info: %w", err)
+	}
+	if rel.TagName == "" {
+		return nil, fmt.Errorf("no release information found")
+	}
+	return &rel, nil
+}
+
 func checkForUpdates() {
 	currentVersion := "v" + version
 
 	// Always show local version first
 	fmt.Printf("Local ver:  %s\n", currentVersion)
 
-	var latestVersion string
-	resp, err := http.Get(githubAPI)
+	rel, err := fetchLatestRelease()
 	if err != nil {
 		fmt.Printf("Remote ver: Error checking for updates: %v\n", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Remote ver: Error checking for updates: HTTP %d\n", resp.StatusCode)
-		return
-	}
-
-	var release struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		fmt.Printf("Remote ver: Error parsing update info: %v\n", err)
-		return
-	}
-
-	if release.TagName == "" {
-		fmt.Printf("Remote ver: Error: no release information found\n")
-		return
-	}
-
-	latestVersion = release.TagName
+	latestVersion := rel.TagName
 	fmt.Printf("Remote ver: %s\n", latestVersion)
 
-	if latestVersion != currentVersion {
+	switch compareVersions(latestVersion, currentVersion) {
+	case 1:
 		fmt.Printf("\nA new version is available.\n")
 		fmt.Printf("Do you want to upgrade now? [y/N]: ")
 
@@ -265,76 +324,110 @@ func checkForUpdates() {
 		response = strings.TrimSpace(strings.ToLower(response))
 		if response == "y" || response == "yes" {
 			fmt.Println()
-			upgradeTool()
+			upgradeTool(rel)
 		} else {
 			fmt.Println("Upgrade cancelled.")
 		}
-	} else {
+	case -1:
+		fmt.Printf("\nYou are using a newer version than the latest release.\n")
+	default:
 		fmt.Printf("\nYou are using the latest version.\n")
 	}
 }
 
-func upgradeTool() {
+// semverParts splits a version string into numeric components, ignoring a
+// leading "v" and any pre-release/build suffix (e.g. "v0.0.4-1-gabc" -> 0.0.4).
+func semverParts(s string) []string {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.Split(s, ".")
+}
+
+// compareVersions returns 1 if a is newer than b, -1 if older, 0 if equal.
+func compareVersions(a, b string) int {
+	pa, pb := semverParts(a), semverParts(b)
+	n := len(pa)
+	if len(pb) > n {
+		n = len(pb)
+	}
+	for i := 0; i < n; i++ {
+		var xa, xb int
+		if i < len(pa) {
+			xa, _ = strconv.Atoi(pa[i])
+		}
+		if i < len(pb) {
+			xb, _ = strconv.Atoi(pb[i])
+		}
+		if xa < xb {
+			return -1
+		}
+		if xa > xb {
+			return 1
+		}
+	}
+	return 0
+}
+
+func upgradeTool(rel *releaseInfo) {
 	fmt.Println("Updating the tool...")
-	resp, err := http.Get(githubAPI)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Error: HTTP %d - repository or release not found\n", resp.StatusCode)
-		return
+	if rel == nil {
+		var err error
+		rel, err = fetchLatestRelease()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return
+		}
 	}
-
-	var release struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			BrowserDownloadURL string `json:"browser_download_url"`
-			Name               string `json:"name"`
-		} `json:"assets"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing update info: %v\n", err)
-		return
-	}
-
-	if release.TagName == "" {
+	if rel.TagName == "" {
 		fmt.Fprintf(os.Stderr, "Error: no release tag found\n")
 		return
 	}
 
-	// Determine which binary to download (prefer Alpine, fallback to Linux)
-	var downloadURL string
-	var assetName string
-	for _, asset := range release.Assets {
-		if strings.Contains(asset.Name, "alpine") && strings.HasSuffix(asset.Name, ".tar.gz") {
-			downloadURL = asset.BrowserDownloadURL
-			assetName = asset.Name
+	// Pick the archive that matches this OS/arch. A missing match is an error
+	// rather than silently installing a binary for the wrong platform.
+	wantName := fmt.Sprintf("passmut-%s-%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	var downloadURL, assetName string
+	for _, asset := range rel.Assets {
+		if asset.Name == wantName {
+			downloadURL, assetName = asset.BrowserDownloadURL, asset.Name
 			break
 		}
 	}
-	// Fallback to Linux if Alpine not found
 	if downloadURL == "" {
-		for _, asset := range release.Assets {
-			if strings.Contains(asset.Name, "linux") && strings.HasSuffix(asset.Name, ".tar.gz") {
-				downloadURL = asset.BrowserDownloadURL
-				assetName = asset.Name
+		for _, asset := range rel.Assets {
+			if strings.HasSuffix(asset.Name, ".tar.gz") && strings.Contains(asset.Name, runtime.GOOS) {
+				downloadURL, assetName = asset.BrowserDownloadURL, asset.Name
 				break
 			}
 		}
 	}
-
 	if downloadURL == "" {
-		fmt.Fprintf(os.Stderr, "Error: no suitable release asset found\n")
+		fmt.Fprintf(os.Stderr, "Error: no release asset found for %s/%s\n", runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	// Locate the published SHA256 for the chosen asset; refuse to install an
+	// unverified binary.
+	wantChecksum := assetName + ".sha256"
+	var checksumURL string
+	for _, asset := range rel.Assets {
+		if asset.Name == wantChecksum {
+			checksumURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+	if checksumURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: release has no checksum asset %q; refusing unverified upgrade\n", wantChecksum)
 		return
 	}
 
 	fmt.Printf("Downloading %s...\n", assetName)
 
 	// Download the archive
-	resp, err = http.Get(downloadURL)
+	resp, err := httpClient.Get(downloadURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error downloading: %v\n", err)
 		return
@@ -362,6 +455,24 @@ func upgradeTool() {
 		return
 	}
 	tmpArchive.Close()
+
+	// Verify the downloaded archive against the published SHA256 before we
+	// touch the installed binary.
+	expectedSum, err := fetchExpectedSHA256(checksumURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error fetching checksum: %v\n", err)
+		return
+	}
+	actualSum, err := fileSHA256(tmpArchive.Name())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error hashing archive: %v\n", err)
+		return
+	}
+	if actualSum != expectedSum {
+		fmt.Fprintf(os.Stderr, "Error: checksum mismatch for %s\n  expected %s\n  actual   %s\nUpgrade aborted.\n", assetName, expectedSum, actualSum)
+		return
+	}
+	fmt.Println("Checksum verified.")
 
 	// Extract the binary from the archive
 	tmpArchive, err = os.Open(tmpArchive.Name())
@@ -406,11 +517,26 @@ func upgradeTool() {
 		return
 	}
 
-	// Get the current binary path
-	currentBinary := os.Args[0]
-	absPath, err := filepath.Abs(currentBinary)
+	// Resolve the real path of the running binary. os.Args[0] is unreliable: it
+	// can be a bare name found via PATH, a relative path, or a symlink, which is
+	// why upgrades could land somewhere other than the binary being executed.
+	exePath, err := os.Executable()
 	if err != nil {
-		absPath = currentBinary
+		exePath = os.Args[0]
+	}
+	absPath, err := filepath.EvalSymlinks(exePath)
+	if err != nil {
+		absPath, err = filepath.Abs(exePath)
+		if err != nil {
+			absPath = exePath
+		}
+	}
+	fmt.Printf("Installing to %s\n", absPath)
+
+	// Preserve the existing file mode where possible.
+	mode := os.FileMode(0755)
+	if info, statErr := os.Stat(absPath); statErr == nil {
+		mode = info.Mode().Perm()
 	}
 
 	// Create temporary file for new binary
@@ -432,7 +558,7 @@ func upgradeTool() {
 	tmpBinary.Close()
 
 	// Make executable
-	err = os.Chmod(tmpBinaryPath, 0755)
+	err = os.Chmod(tmpBinaryPath, mode)
 	if err != nil {
 		os.Remove(tmpBinaryPath)
 		fmt.Fprintf(os.Stderr, "Error setting permissions: %v\n", err)
@@ -443,12 +569,59 @@ func upgradeTool() {
 	err = os.Rename(tmpBinaryPath, absPath)
 	if err != nil {
 		os.Remove(tmpBinaryPath)
-		fmt.Fprintf(os.Stderr, "Error replacing binary: %v\n", err)
-		fmt.Fprintf(os.Stderr, "You may need to run with sudo or replace manually\n")
+		fmt.Fprintf(os.Stderr, "Error replacing %s: %v\n", absPath, err)
+		fmt.Fprintf(os.Stderr, "You may need to run with sudo or replace it manually\n")
 		return
 	}
 
-	fmt.Printf("Successfully upgraded to %s\n", release.TagName)
+	fmt.Printf("Successfully upgraded to %s\n", rel.TagName)
+}
+
+// warnBadRange reports an invalid numeric range once per run.
+func (m *Mangler) warnBadRange(r string) {
+	m.limitOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "Warning: invalid number range %q; expected e.g. 1980-2020, 01-99 or 1980-current\n", r)
+	})
+}
+
+// fetchExpectedSHA256 downloads a .sha256 release asset and returns the first
+// hex digest it contains (lowercased).
+func fetchExpectedSHA256(checksumURL string) (string, error) {
+	resp, err := httpClient.Get(checksumURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty checksum file")
+	}
+	sum := strings.ToLower(strings.TrimSpace(fields[0]))
+	if len(sum) != sha256.Size*2 {
+		return "", fmt.Errorf("malformed checksum %q", sum)
+	}
+	return sum, nil
+}
+
+// fileSHA256 returns the lowercase hex SHA256 of a file.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func parseFlags(args []string) *Config {
@@ -502,6 +675,7 @@ func parseFlags(args []string) *Config {
 	fs.StringVar(&config.suffixRange, "sr", "", "suffix range (shorthand)")
 	fs.BoolVar(&config.space, "space", false, "add spaces")
 	fs.BoolVar(&config.showVersion, "v", false, "show version")
+	fs.BoolVar(&config.showVersion, "version", false, "show version (long form)")
 	fs.BoolVar(&config.analyze, "analyze", false, "analyze input")
 	fs.BoolVar(&config.analyze, "a", false, "analyze input (shorthand)")
 	fs.StringVar(&config.crunchFilter, "crunch", "", "crunch filter")
@@ -530,8 +704,24 @@ func parseFlags(args []string) *Config {
 	fs.BoolVar(&config.keyboardWalks, "walks", false, "add common keyboard walks")
 	fs.BoolVar(&config.smartAffix, "smart-affix", false, "add smart affixes (years, 123, symbols)")
 	fs.BoolVar(&config.toggleVariations, "toggle-variations", false, "add toggle case permutations")
+	fs.IntVar(&config.maxResults, "max-results", defaultMaxResults, "cap on buffered/generated results (0 = unlimited)")
+	fs.BoolVar(&config.noDedup, "no-dedup", false, "disable output de-duplication (saves memory, may emit duplicates)")
+	fs.IntVar(&config.ppCount, "pp-count", 1000, "number of random passphrases to generate")
+	fs.Int64Var(&config.ppSeed, "pp-seed", 0, "seed for reproducible passphrase generation (0 = random)")
 
 	fs.Parse(args)
+
+	// Validate enum-like flags up front so a typo is not silently ignored.
+	if config.sortMode != "" && config.sortMode != "a" && config.sortMode != "e" {
+		fmt.Fprintf(os.Stderr, "Warning: unknown --sort value %q (expected 'a' or 'e')\n", config.sortMode)
+		config.sortMode = ""
+	}
+	if config.mutationLevel < 0 {
+		config.mutationLevel = 0
+	} else if config.mutationLevel > 2 {
+		fmt.Fprintf(os.Stderr, "Warning: --level %d out of range (0-2); using 2\n", config.mutationLevel)
+		config.mutationLevel = 2
+	}
 	return config
 }
 
@@ -582,6 +772,10 @@ func showUsage() {
 	// Long-only options
 	fmt.Fprintf(os.Stderr, "\t%s--rules%s %s<operators>%s: custom recipe (e.g. %s-r,-u,-t%s)\n", y, r, b, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s--exclude-common%s %s<file>%s: blacklist file\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\t%s--max-results%s %s<N>%s: cap buffered/generated results (0 = unlimited)\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\t%s--no-dedup%s: disable output de-duplication\n", y, r)
+	fmt.Fprintf(os.Stderr, "\t%s--pp-count%s %s<N>%s: number of random passphrases (default 1000)\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\t%s--pp-seed%s %s<N>%s: seed for reproducible passphrases (0 = random)\n", y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\t%s--check-updates%s, %s--upgrade%s: maintenance engine\n", y, r, y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--punctuation%s: add common punctuation to the end\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--space%s: add spaces between words\n", y, r)
@@ -589,21 +783,7 @@ func showUsage() {
 	fmt.Fprintf(os.Stderr, "\t%s--no-numbers%s: exclude words with numbers\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--no-symbols%s: exclude words with symbols\n", y, r)
 	fmt.Fprintf(os.Stderr, "\t%s--no-capitals%s: exclude words with capitals\n", y, r)
-	//fmt.Fprintf(os.Stderr, "\t%s  %s\n", renderTogglePill(false), renderTogglePill(true))
 }
-
-// renderTogglePill returns a pill-shaped toggle indicator
-// OFF: gray circle (◯), ON: green filled circle (●)
-// func renderTogglePill(isOn bool) string {
-// 	gray := "\033[90m"   // Bright black (gray)
-// 	green := "\033[32m"  // Green
-// 	reset := "\033[0m"   // Reset
-// 	if isOn {
-// 		return fmt.Sprintf("%s●%s", green, reset)
-// 	} else {
-// 		return fmt.Sprintf("%s◯%s", gray, reset)
-// 	}
-// }
 
 func showLongUsage() {
 	y := "\033[33m"
@@ -646,7 +826,12 @@ func showLongUsage() {
 	fmt.Fprintf(os.Stderr, "  %s--exclude-common%s %s<file>%s\n", y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\tSupply a file of passwords to discard from final results.\n")
 	fmt.Fprintf(os.Stderr, "  %s--no-numbers%s, %s--no-symbols%s, %s--no-capitals%s\n", y, r, y, r, y, r)
-	fmt.Fprintf(os.Stderr, "\tExclude words containing numbers, symbols, or capital letters respectively.\n\n")
+	fmt.Fprintf(os.Stderr, "\tExclude words containing numbers, symbols, or capital letters respectively.\n")
+	fmt.Fprintf(os.Stderr, "  %s--max-results%s %s<N>%s\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\tCap how many results are buffered in memory (sort/passphrase) and how many\n")
+	fmt.Fprintf(os.Stderr, "\tpermutations/full-leet/case variants are generated. 0 disables the cap.\n")
+	fmt.Fprintf(os.Stderr, "  %s--no-dedup%s\n", y, r)
+	fmt.Fprintf(os.Stderr, "\tDisable global output de-duplication (saves memory on huge runs).\n\n")
 
 	// SORTING & PRIORITIZATION
 	fmt.Fprintf(os.Stderr, "SORTING & PRIORITIZATION:\n")
@@ -661,7 +846,11 @@ func showLongUsage() {
 	fmt.Fprintf(os.Stderr, "\tInstead of mangling, it generates random combinations of N words.\n")
 	fmt.Fprintf(os.Stderr, "  %s--sep%s %s<char>%s\n", y, r, b, r)
 	fmt.Fprintf(os.Stderr, "\tThe separator to use between words (defaults to '-').\n")
-	fmt.Fprintf(os.Stderr, "\tExample: %s-pp%s %s3%s %s--sep%s %s_%s\n\n", y, r, b, r, y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\tExample: %s-pp%s %s3%s %s--sep%s %s_%s\n", y, r, b, r, y, r, b, r)
+	fmt.Fprintf(os.Stderr, "  %s--pp-count%s %s<N>%s\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\tNumber of random passphrases to generate (default 1000).\n")
+	fmt.Fprintf(os.Stderr, "  %s--pp-seed%s %s<N>%s\n", y, r, b, r)
+	fmt.Fprintf(os.Stderr, "\tSeed the passphrase RNG for reproducible output (0 = random).\n\n")
 
 	// TEXT MANIPULATION (SIMPLE)
 	fmt.Fprintf(os.Stderr, "TEXT MANIPULATION (SIMPLE):\n")
@@ -729,13 +918,18 @@ func run(config *Config, inputPaths []string) error {
 				fmt.Fprintf(os.Stderr, "Warning: failed to open %s: %v\n", p, err)
 				continue
 			}
-			defer f.Close()
+			// Close each file as soon as it is read instead of deferring until
+			// run returns (a glob can match thousands of files).
 			input = f
 		}
 		words, err := loadWords(input)
-		if err == nil {
-			allWords = append(allWords, words...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to read %s: %v\n", p, err)
 		}
+		if c, ok := input.(io.Closer); ok && input != os.Stdin {
+			c.Close()
+		}
+		allWords = append(allWords, words...)
 	}
 
 	if config.seedWords != "" {
@@ -796,11 +990,13 @@ func run(config *Config, inputPaths []string) error {
 
 	mangler := &Mangler{
 		config:           config,
-		output:           output,
-		seenCRCs:         make(map[uint32]struct{}),
+		seenHashes:       make(map[uint64]struct{}),
 		blacklistedWords: blacklist,
 		currentCommon:    commonSet,
 		bufWriter:        bufio.NewWriterSize(output, 64*1024),
+		prefixList:       splitComma(config.prefixStrings),
+		suffixList:       splitComma(config.suffixStrings),
+		ruleList:         splitComma(config.rulesList),
 	}
 
 	defer mangler.bufWriter.Flush()
@@ -820,6 +1016,7 @@ func loadBlacklist(path string) (map[string]struct{}, error) {
 
 	bl := make(map[string]struct{})
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		w := strings.TrimSpace(scanner.Text())
 		if w != "" {
@@ -832,6 +1029,7 @@ func loadBlacklist(path string) (map[string]struct{}, error) {
 func loadWords(r io.Reader) ([]string, error) {
 	var words []string
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		w := strings.TrimSpace(scanner.Text())
 		if w != "" {
@@ -925,17 +1123,29 @@ func (m *Mangler) process(words []string) error {
 		if m.config.sortMode == "a" {
 			sort.Strings(m.collectedResults)
 		} else if m.config.sortMode == "e" {
-			sort.Slice(m.collectedResults, func(i, j int) bool {
-				si := getWordEfficacy(m.collectedResults[i])
-				sj := getWordEfficacy(m.collectedResults[j])
-				if si == sj {
-					return m.collectedResults[i] < m.collectedResults[j]
+			// Decorate once: sort.Slice would otherwise recompute the (fairly
+			// expensive) efficacy for each comparison, i.e. O(n log n) times.
+			type scored struct {
+				word  string
+				score float64
+			}
+			scoredList := make([]scored, len(m.collectedResults))
+			for i, w := range m.collectedResults {
+				scoredList[i] = scored{word: w, score: getWordEfficacy(w)}
+			}
+			sort.Slice(scoredList, func(i, j int) bool {
+				if scoredList[i].score == scoredList[j].score {
+					return scoredList[i].word < scoredList[j].word
 				}
-				return si > sj
+				return scoredList[i].score > scoredList[j].score
 			})
+			for i, s := range scoredList {
+				m.collectedResults[i] = s.word
+			}
 		}
 		for _, w := range m.collectedResults {
-			m.bufWriter.WriteString(w + "\n")
+			m.bufWriter.WriteString(w)
+			m.bufWriter.WriteByte('\n')
 		}
 	}
 	return nil
@@ -948,6 +1158,12 @@ func (m *Mangler) generateCombinedPassphrases(pool []string) error {
 
 	// Exhaustive Mode: If the pool is small enough, generate every possible permutation
 	// Threshold: pool^count < 5000
+	// With a fixed seed, sort the pool so the result does not depend on the
+	// order in which worker goroutines contributed components.
+	if m.config.ppSeed != 0 {
+		sort.Strings(pool)
+	}
+
 	expected := math.Pow(float64(len(pool)), float64(m.config.passphraseCount))
 
 	if expected < 10000 {
@@ -955,16 +1171,20 @@ func (m *Mangler) generateCombinedPassphrases(pool []string) error {
 		m.exhaustivePP(pool, m.config.passphraseCount, []string{})
 	} else {
 		// Random Sampling Mode
-		count := 1000
+		count := m.config.ppCount
+		if count <= 0 {
+			count = 1000
+		}
+		intn := rand.IntN
+		if m.config.ppSeed != 0 {
+			// Deterministic RNG so --pp output can be reproduced.
+			rng := rand.New(rand.NewPCG(uint64(m.config.ppSeed), uint64(m.config.ppSeed)*0x9e3779b97f4a7c15))
+			intn = rng.IntN
+		}
 		for i := 0; i < count; i++ {
-			indices := make([]int, m.config.passphraseCount)
-			for j := 0; j < m.config.passphraseCount; j++ {
-				indices[j] = int(uint64(time.Now().UnixNano()) % uint64(len(pool)))
-				time.Sleep(1 * time.Nanosecond)
-			}
-			var parts []string
-			for _, idx := range indices {
-				parts = append(parts, pool[idx])
+			parts := make([]string, m.config.passphraseCount)
+			for j := range parts {
+				parts[j] = pool[intn(len(pool))]
 			}
 			m.writeWord(strings.Join(parts, m.config.passphraseSep))
 		}
@@ -982,16 +1202,21 @@ func (m *Mangler) exhaustivePP(pool []string, rem int, cur []string) {
 	}
 }
 
+// chainMangle applies two rounds of mutation: every first-round variation is
+// itself re-mangled and only the second-round results are emitted. Unlike the
+// previous implementation it keeps all state local to the call, so it no
+// longer races on the shared config/collection when run from many goroutines.
 func (m *Mangler) chainMangle(word string) {
-	oldSort := m.config.sortMode
-	m.config.sortMode = "INTERNAL_POOL" // Consistent with final collection bypass
-	m.mangleWord(word)
-	tmp := make([]string, len(m.collectedResults))
-	copy(tmp, m.collectedResults)
-	m.collectedResults = nil
-	m.config.sortMode = oldSort
-	for _, w := range tmp {
-		m.mangleWord(w)
+	if m.config.rulesList != "" {
+		// A recipe already describes the full transformation sequence;
+		// there is nothing meaningful to chain on top of it.
+		m.applySequence(word)
+		return
+	}
+	for _, w := range m.generateVariations(word) {
+		for _, v := range m.generateVariations(w) {
+			m.writeWord(v)
+		}
 	}
 }
 
@@ -1000,94 +1225,176 @@ func (m *Mangler) mangleWord(word string) {
 		m.applySequence(word)
 		return
 	}
-
-	res := make(map[string]struct{})
-	res[word] = struct{}{}
-	if m.config.double {
-		res[word+word] = struct{}{}
+	// Plain pass-through needs no variation slice at all.
+	if !m.hasTransformations() {
+		m.writeWord(word)
+		return
 	}
-	if m.config.reverse {
-		res[reverseString(word)] = struct{}{}
-	}
-	if m.config.capital {
-		res[capitalize(word)] = struct{}{}
-	}
-	if m.config.lower {
-		res[strings.ToLower(word)] = struct{}{}
-	}
-	if m.config.upper {
-		res[strings.ToUpper(word)] = struct{}{}
-	}
-	if m.config.swap {
-		res[swapCase(word)] = struct{}{}
-	}
-	if m.config.prefixStrings != "" {
-		for _, s := range strings.Split(m.config.prefixStrings, ",") {
-			res[strings.TrimSpace(s)+word] = struct{}{}
-		}
-	}
-	if m.config.suffixStrings != "" {
-		for _, s := range strings.Split(m.config.suffixStrings, ",") {
-			res[word+strings.TrimSpace(s)] = struct{}{}
-		}
-	}
-	if m.config.common != "" {
-		for _, c := range m.currentCommon {
-			res[c+word] = struct{}{}
-			res[word+c] = struct{}{}
-		}
-	}
-	if m.config.fullLeet {
-		for _, v := range generateFullLeetVariations(word) {
-			res[v] = struct{}{}
-		}
-	} else if m.config.leet {
-		allSwapped := word
-		for char, reps := range leetMap {
-			if len(reps) > 0 {
-				rep := string(reps[0])
-				res[strings.ReplaceAll(word, string(char), rep)] = struct{}{}
-				allSwapped = strings.ReplaceAll(allSwapped, string(char), rep)
-			}
-		}
-		res[allSwapped] = struct{}{}
-	}
-	if m.config.allCases {
-		for _, v := range generateAllCasePermutations(word) {
-			res[v] = struct{}{}
-		}
-	}
-	if m.config.punctuation {
-		for _, p := range "!@$%^&*()" {
-			res[word+string(p)] = struct{}{}
-		}
-	}
-	if m.config.smartAffix {
-		m.addSmartAffixes(word, res)
-	}
-	if m.config.toggleVariations {
-		for _, v := range generateToggleVariations(word) {
-			res[v] = struct{}{}
-		}
-	}
-	if m.config.yearsCount != "" {
-		m.addNumberRange(word, m.config.yearsCount, true, res)
-		m.addNumberRange(word, m.config.yearsCount, false, res)
-	}
-	if m.config.prefixRange != "" {
-		m.addNumberRange(word, m.config.prefixRange, true, res)
-	}
-	if m.config.suffixRange != "" {
-		m.addNumberRange(word, m.config.suffixRange, false, res)
-	}
-
-	for w := range res {
+	for _, w := range m.generateVariations(word) {
 		m.writeWord(w)
 	}
 }
 
+// hasTransformations reports whether any word-transformation option is enabled.
+func (m *Mangler) hasTransformations() bool {
+	c := m.config
+	return c.double || c.reverse || c.capital || c.lower || c.upper || c.swap ||
+		c.prefixStrings != "" || c.suffixStrings != "" || c.common != "" ||
+		c.fullLeet || c.leet || c.allCases || c.punctuation || c.smartAffix ||
+		c.toggleVariations || c.yearsCount != "" || c.prefixRange != "" || c.suffixRange != ""
+}
+
+// generateVariations returns the ordered, de-duplicated single-round mutations
+// of word. It is pure (it never touches shared Mangler state), which makes it
+// safe to call concurrently from worker goroutines. Ordering is deterministic
+// so unsorted output is reproducible across runs.
+func (m *Mangler) generateVariations(word string) []string {
+	// Fast path: with no transformation enabled the word is the only result,
+	// so skip the per-word set/slice allocation entirely.
+	if !m.hasTransformations() {
+		return []string{word}
+	}
+
+	seen := make(map[string]struct{}, 8)
+	res := make([]string, 0, 8)
+	add := func(s string) {
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		res = append(res, s)
+	}
+
+	add(word)
+	if m.config.double {
+		add(word + word)
+	}
+	if m.config.reverse {
+		add(reverseString(word))
+	}
+	if m.config.capital {
+		add(capitalize(word))
+	}
+	if m.config.lower {
+		add(strings.ToLower(word))
+	}
+	if m.config.upper {
+		add(strings.ToUpper(word))
+	}
+	if m.config.swap {
+		add(swapCase(word))
+	}
+	if m.config.prefixStrings != "" {
+		list := m.prefixList
+		if list == nil {
+			list = splitComma(m.config.prefixStrings)
+		}
+		for _, s := range list {
+			add(s + word)
+		}
+	}
+	if m.config.suffixStrings != "" {
+		list := m.suffixList
+		if list == nil {
+			list = splitComma(m.config.suffixStrings)
+		}
+		for _, s := range list {
+			add(word + s)
+		}
+	}
+	if m.config.common != "" {
+		for _, c := range m.currentCommon {
+			add(c + word)
+			add(word + c)
+		}
+	}
+	if m.config.fullLeet {
+		variants := generateFullLeetVariations(word, m.config.maxResults)
+		if m.config.maxResults > 0 && len(variants) >= m.config.maxResults {
+			m.limitOnce.Do(func() {
+				fmt.Fprintf(os.Stderr, "Warning: full-leet generation stopped at --max-results=%d (use --max-results 0 to disable the cap).\n", m.config.maxResults)
+			})
+		}
+		for _, v := range variants {
+			add(v)
+		}
+	} else if m.config.leet {
+		// One variant per distinct leetable character plus a fully-swapped
+		// variant. Substitutions are applied in a single pass so the result
+		// does not cascade.
+		seenChar := make(map[rune]struct{})
+		for _, r := range word {
+			reps, ok := leetMap[r]
+			if !ok || len(reps) == 0 {
+				continue
+			}
+			if _, done := seenChar[r]; done {
+				continue
+			}
+			seenChar[r] = struct{}{}
+			add(strings.ReplaceAll(word, string(r), string(reps[0])))
+		}
+		add(leetSwap(word))
+	}
+	if m.config.allCases {
+		variants := generateAllCasePermutations(word, m.config.maxResults)
+		if len(variants) == 0 && m.config.maxResults > 0 {
+			m.limitOnce.Do(func() {
+				fmt.Fprintf(os.Stderr, "Warning: all-cases skipped a word exceeding --max-results=%d (use --max-results 0 to disable the cap).\n", m.config.maxResults)
+			})
+		}
+		for _, v := range variants {
+			add(v)
+		}
+	}
+	if m.config.punctuation {
+		for _, p := range punctuationSuffixes {
+			add(word + p)
+		}
+	}
+	if m.config.smartAffix {
+		m.addSmartAffixes(word, add)
+	}
+	if m.config.toggleVariations {
+		for _, v := range generateToggleVariations(word) {
+			add(v)
+		}
+	}
+	if m.config.yearsCount != "" {
+		m.addNumberRange(word, m.config.yearsCount, true, add)
+		m.addNumberRange(word, m.config.yearsCount, false, add)
+	}
+	if m.config.prefixRange != "" {
+		m.addNumberRange(word, m.config.prefixRange, true, add)
+	}
+	if m.config.suffixRange != "" {
+		m.addNumberRange(word, m.config.suffixRange, false, add)
+	}
+
+	return res
+}
+
+// leetSwap replaces each mappable character with the first leet substitution
+// in a single pass. Because it never re-examines produced characters it is
+// deterministic (unlike iterating over the map with strings.ReplaceAll).
+func leetSwap(word string) string {
+	var b strings.Builder
+	b.Grow(len(word))
+	for _, r := range word {
+		if reps, ok := leetMap[r]; ok && len(reps) > 0 {
+			b.WriteRune(reps[0])
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func (m *Mangler) applySequence(word string) {
-	rules := strings.Split(m.config.rulesList, ",")
+	rules := m.ruleList
+	if rules == nil {
+		rules = splitComma(m.config.rulesList)
+	}
 	current := []string{word}
 
 	for _, rule := range rules {
@@ -1110,14 +1417,13 @@ func (m *Mangler) applySequence(word string) {
 			case "-d", "--double", "double":
 				nextSet = append(nextSet, w+w)
 			case "-t", "--leet", "leet":
-				swapped := w
-				for char, reps := range leetMap {
-					if len(reps) > 0 {
-						swapped = strings.ReplaceAll(swapped, string(char), string(reps[0]))
-					}
-				}
-				nextSet = append(nextSet, swapped)
+				nextSet = append(nextSet, leetSwap(w))
+			case "":
+				nextSet = append(nextSet, w)
 			default:
+				m.limitOnce.Do(func() {
+					fmt.Fprintf(os.Stderr, "Warning: unknown rule %q ignored (see --rules in --help)\n", rule)
+				})
 				nextSet = append(nextSet, w)
 			}
 		}
@@ -1175,20 +1481,63 @@ func (m *Mangler) writeWord(word string) {
 
 	// If we are building an internal pool, we bypass all final filters
 	if strings.HasPrefix(m.config.sortMode, "INTERNAL") {
+		if m.resultBufferFull() {
+			return
+		}
 		m.collectedResults = append(m.collectedResults, word)
 		return
 	}
 
-	crc := crc32.ChecksumIEEE([]byte(word))
-	if _, exists := m.seenCRCs[crc]; exists {
-		return
+	// Dedup on a 64-bit FNV-1a hash. A 32-bit CRC collides surprisingly often
+	// on large wordlists (thousands of collisions per million words), which
+	// silently drops legitimate distinct results; 64 bits makes accidental
+	// collisions negligible without paying for an exact string set. --no-dedup
+	// skips this entirely for very large runs where the set would be too big.
+	if !m.config.noDedup {
+		if m.seenHashes == nil {
+			m.seenHashes = make(map[uint64]struct{})
+		}
+		h := fnv1a64(word)
+		if _, exists := m.seenHashes[h]; exists {
+			return
+		}
+		m.seenHashes[h] = struct{}{}
 	}
-	m.seenCRCs[crc] = struct{}{}
 	if m.config.sortMode != "" {
+		if m.resultBufferFull() {
+			return
+		}
 		m.collectedResults = append(m.collectedResults, word)
 		return
 	}
-	m.bufWriter.WriteString(word + "\n")
+	m.bufWriter.WriteString(word)
+	m.bufWriter.WriteByte('\n')
+}
+
+// resultBufferFull reports whether the in-memory result buffer has reached
+// --max-results. Callers must hold m.mu. The warning is emitted once.
+func (m *Mangler) resultBufferFull() bool {
+	if m.config.maxResults <= 0 || len(m.collectedResults) < m.config.maxResults {
+		return false
+	}
+	m.limitOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "Warning: result buffer reached --max-results=%d; further results are dropped (use --max-results 0 to disable the cap).\n", m.config.maxResults)
+	})
+	return true
+}
+
+// fnv1a64 is a small, allocation-free 64-bit FNV-1a hash used for dedup.
+func fnv1a64(s string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
 }
 
 func calculateStrength(s string) int {
@@ -1287,32 +1636,36 @@ func (m *Mangler) matchesCrunch(s string) bool {
 	return true
 }
 
-func (m *Mangler) addNumberRange(word string, r string, prefix bool, res map[string]struct{}) {
+func (m *Mangler) addNumberRange(word string, r string, prefix bool, add func(string)) {
 	parts := strings.Split(r, "-")
 	if len(parts) != 2 {
+		m.warnBadRange(r)
 		return
 	}
 	cur := time.Now().Year()
 	parse := func(s string) int {
-		if strings.ToLower(strings.TrimSpace(s)) == "current" {
+		s = strings.TrimSpace(s)
+		if strings.ToLower(s) == "current" {
 			return cur
 		}
-		var v int
-		fmt.Sscanf(s, "%d", &v)
+		v, err := strconv.Atoi(s)
+		if err != nil {
+			m.warnBadRange(r)
+		}
 		return v
 	}
 	sVal, eVal := parse(parts[0]), parse(parts[1])
 	pad := len(strings.TrimSpace(parts[0]))
-	fmtStr := "%d"
-	if strings.HasPrefix(strings.TrimSpace(parts[0]), "0") || (pad > 1 && sVal < 10) {
-		fmtStr = fmt.Sprintf("%%0%dd", pad)
-	}
+	zeroPad := strings.HasPrefix(strings.TrimSpace(parts[0]), "0") || (pad > 1 && sVal < 10)
 	for i := sVal; i <= eVal; i++ {
-		ns := fmt.Sprintf(fmtStr, i)
+		ns := strconv.Itoa(i)
+		if zeroPad && len(ns) < pad {
+			ns = strings.Repeat("0", pad-len(ns)) + ns
+		}
 		if prefix {
-			res[ns+word] = struct{}{}
+			add(ns + word)
 		} else {
-			res[word+ns] = struct{}{}
+			add(word + ns)
 		}
 	}
 }
@@ -1323,13 +1676,25 @@ func (m *Mangler) generatePermutations(words []string) []string {
 	if m.config.space {
 		sep = " "
 	}
+	limit := m.config.maxResults
 	for l := 1; l <= len(words); l++ {
-		m.permuteHelper(words, l, []string{}, &res, sep)
+		if limit > 0 && len(res) >= limit {
+			break
+		}
+		m.permuteHelper(words, l, []string{}, &res, sep, limit)
+	}
+	if limit > 0 && len(res) >= limit {
+		m.limitOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "Warning: permutation generation stopped at --max-results=%d (use --max-results 0 to disable the cap).\n", limit)
+		})
 	}
 	return res
 }
 
-func (m *Mangler) permuteHelper(words []string, l int, cur []string, res *[]string, sep string) {
+func (m *Mangler) permuteHelper(words []string, l int, cur []string, res *[]string, sep string, limit int) {
+	if limit > 0 && len(*res) >= limit {
+		return
+	}
 	if len(cur) == l {
 		p := strings.Join(cur, sep)
 		*res = append(*res, p)
@@ -1337,6 +1702,9 @@ func (m *Mangler) permuteHelper(words []string, l int, cur []string, res *[]stri
 		return
 	}
 	for i := 0; i < len(words); i++ {
+		if limit > 0 && len(*res) >= limit {
+			return
+		}
 		used := false
 		for _, w := range cur {
 			if w == words[i] {
@@ -1345,7 +1713,7 @@ func (m *Mangler) permuteHelper(words []string, l int, cur []string, res *[]stri
 			}
 		}
 		if !used {
-			m.permuteHelper(words, l, append(cur, words[i]), res, sep)
+			m.permuteHelper(words, l, append(cur, words[i]), res, sep, limit)
 		}
 	}
 }
@@ -1373,29 +1741,33 @@ func capitalize(s string) string {
 		return s
 	}
 	r := []rune(s)
-	r[0] = []rune(strings.ToUpper(string(r[0])))[0]
+	r[0] = unicode.ToUpper(r[0])
 	return string(r)
 }
 
 func swapCase(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r >= 'a' && r <= 'z' {
-			b.WriteRune(r - 32)
-		} else if r >= 'A' && r <= 'Z' {
-			b.WriteRune(r + 32)
-		} else {
+		switch {
+		case unicode.IsLower(r):
+			b.WriteRune(unicode.ToUpper(r))
+		case unicode.IsUpper(r):
+			b.WriteRune(unicode.ToLower(r))
+		default:
 			b.WriteRune(r)
 		}
 	}
 	return b.String()
 }
 
-func generateFullLeetVariations(word string) []string {
-	lw := strings.ToLower(word)
+func generateFullLeetVariations(word string, limit int) []string {
+	// Work on runes throughout: the old code used byte offsets from
+	// strings.ToLower as positions into a []rune slice, which produced wrong
+	// results (or panics) for non-ASCII input.
+	runes := []rune(word)
 	var sbs []substitution
-	for i, r := range lw {
-		if rps, ok := leetMap[r]; ok {
+	for i, r := range runes {
+		if rps, ok := leetMap[unicode.ToLower(r)]; ok {
 			sbs = append(sbs, substitution{i, rps})
 		}
 	}
@@ -1403,42 +1775,70 @@ func generateFullLeetVariations(word string) []string {
 		return []string{word}
 	}
 	var res []string
-	generateLeetCombinations([]rune(word), sbs, 0, &res)
+	generateLeetCombinations(runes, sbs, 0, &res, limit)
 	return res
 }
 
-func generateLeetCombinations(w []rune, sbs []substitution, idx int, res *[]string) {
+func generateLeetCombinations(w []rune, sbs []substitution, idx int, res *[]string, limit int) {
+	if limit > 0 && len(*res) >= limit {
+		return
+	}
 	if idx == len(sbs) {
 		*res = append(*res, string(w))
 		return
 	}
 	sb := sbs[idx]
 	orig := w[sb.pos]
-	generateLeetCombinations(w, sbs, idx+1, res)
+	generateLeetCombinations(w, sbs, idx+1, res, limit)
 	for _, r := range sb.chars {
+		if limit > 0 && len(*res) >= limit {
+			break
+		}
 		w[sb.pos] = r
-		generateLeetCombinations(w, sbs, idx+1, res)
+		generateLeetCombinations(w, sbs, idx+1, res, limit)
 	}
 	w[sb.pos] = orig
 }
 
-func generateAllCasePermutations(word string) []string {
-	var results []string
-	n := len(word)
+// maxCaseLength returns the longest word for which all 2^n case permutations
+// stay within limit. A limit <= 0 falls back to the hard safety bound.
+func maxCaseLength(limit int) int {
+	const hardMax = 24 // 2^n must fit in an int, and 16M strings is already huge
+	if limit <= 0 {
+		return hardMax
+	}
+	n := 0
+	for n < hardMax && (1<<(n+1)) <= limit {
+		n++
+	}
+	return n
+}
+
+func generateAllCasePermutations(word string, limit int) []string {
+	runes := []rune(word)
+	// n must be a rune count: the old code used the byte length, which
+	// mismatched the rune slice for non-ASCII input and panicked.
+	n := len(runes)
+	if n == 0 {
+		return nil
+	}
+	// 2^n grows extremely fast; bound it by --max-results (and a hard cap so
+	// the shift cannot overflow).
+	if n > maxCaseLength(limit) {
+		return nil
+	}
 	max := 1 << n
 
-	// Pre-calculate lower and upper runes to avoid repeated calls
-	runes := []rune(word)
 	lowers := make([]rune, n)
 	uppers := make([]rune, n)
-
 	for i, r := range runes {
-		lowers[i] = []rune(strings.ToLower(string(r)))[0]
-		uppers[i] = []rune(strings.ToUpper(string(r)))[0]
+		lowers[i] = unicode.ToLower(r)
+		uppers[i] = unicode.ToUpper(r)
 	}
 
+	results := make([]string, 0, max)
+	current := make([]rune, n)
 	for i := 0; i < max; i++ {
-		current := make([]rune, n)
 		for j := 0; j < n; j++ {
 			if (i>>j)&1 == 1 {
 				current[j] = uppers[j]
@@ -1452,8 +1852,11 @@ func generateAllCasePermutations(word string) []string {
 }
 
 func getWordEfficacy(s string) float64 {
+	// Range over the string directly (no allocation) while still counting runes,
+	// so length and the second/last-rune checks stay correct for non-ASCII input
+	// without building an intermediate []rune.
 	w := 1.0
-	l := len(s)
+	l := utf8.RuneCountInString(s)
 	if v, ok := lengthChances[l]; ok {
 		w *= v
 	} else if l > 24 {
@@ -1464,8 +1867,10 @@ func getWordEfficacy(s string) float64 {
 	hasLower, hasUpper, hasNumber, hasSpec := false, false, false, false
 	allLower, allUpper, onlyNumbers := true, true, true
 	firstUpper := false
+	var second, last rune
+	idx := 0
 
-	for i, r := range s {
+	for _, r := range s {
 		isLower := r >= 'a' && r <= 'z'
 		isUpper := r >= 'A' && r <= 'Z'
 		isNum := r >= '0' && r <= '9'
@@ -1480,7 +1885,7 @@ func getWordEfficacy(s string) float64 {
 			hasUpper = true
 			allLower = false
 			onlyNumbers = false
-			if i == 0 {
+			if idx == 0 {
 				firstUpper = true
 			}
 		}
@@ -1495,6 +1900,11 @@ func getWordEfficacy(s string) float64 {
 			allUpper = false
 			onlyNumbers = false
 		}
+		if idx == 1 {
+			second = r
+		}
+		last = r
+		idx++
 	}
 
 	if hasLower && allLower {
@@ -1518,17 +1928,15 @@ func getWordEfficacy(s string) float64 {
 	if onlyNumbers && hasNumber {
 		combo |= MaskOnlyNumbers
 	}
-	if firstUpper && len(s) > 1 {
+	if firstUpper && l > 1 {
 		// Check second char is not upper
-		r2 := []rune(s)[1]
-		if !(r2 >= 'A' && r2 <= 'Z') {
+		if !(second >= 'A' && second <= 'Z') {
 			combo |= MaskFirstUpper
 		}
 	}
 
 	// Suffix checks
-	if len(s) > 0 {
-		last := s[len(s)-1]
+	if l > 0 {
 		if last >= '0' && last <= '9' {
 			combo |= MaskEndsInNumber
 		}
@@ -1556,18 +1964,32 @@ func analyzeWordlist(words []string) {
 	strengths := make(map[int]int)
 	var totalScore int
 
-	rn, rs, ru, rl := regexp.MustCompile(`[0-9]`), regexp.MustCompile(`[^A-Za-z0-9]`), regexp.MustCompile(`[A-Z]`), regexp.MustCompile(`[a-z]`)
+	// Single byte scan per word rather than four regexp matches; this is a
+	// meaningful win on multi-million-line lists.
 	for _, w := range words {
-		if rn.MatchString(w) {
+		hasNum, hasSpec, hasUpper, hasLower := false, false, false, false
+		for i := 0; i < len(w); i++ {
+			switch c := w[i]; {
+			case c >= '0' && c <= '9':
+				hasNum = true
+			case c >= 'A' && c <= 'Z':
+				hasUpper = true
+			case c >= 'a' && c <= 'z':
+				hasLower = true
+			default:
+				hasSpec = true
+			}
+		}
+		if hasNum {
 			n++
 		}
-		if rs.MatchString(w) {
+		if hasSpec {
 			sp++
 		}
-		if ru.MatchString(w) {
+		if hasUpper {
 			u++
 		}
-		if rl.MatchString(w) {
+		if hasLower {
 			l++
 		}
 		lens[len(w)]++
@@ -1637,7 +2059,7 @@ var lengthChances = map[int]float64{
 var comboChances = map[int]float64{
 	16: 0.78, 4: 0.76, 20: 0.76, 256: 0.49, 272: 0.29, 260: 0.29, 276: 0.29,
 	32: 0.28, 288: 0.28, 48: 0.27, 304: 0.27, 36: 0.27, 52: 0.27, 292: 0.27,
-	1024: 0.19, 1280: 0.19, 8: 0.03, 1: 0.02, 9: 0.02, 	128: 0.019,
+	1024: 0.19, 1280: 0.19, 8: 0.03, 1: 0.02, 9: 0.02, 128: 0.019,
 }
 
 func getKeyboardWalks() []string {
@@ -1650,34 +2072,34 @@ func getKeyboardWalks() []string {
 	}
 }
 
-func (m *Mangler) addSmartAffixes(word string, res map[string]struct{}) {
+func (m *Mangler) addSmartAffixes(word string, add func(string)) {
 	// Years: current and past 5
 	cur := time.Now().Year()
 	for i := 0; i <= 5; i++ {
 		y := cur - i
-		ys := fmt.Sprintf("%d", y)
-		res[word+ys] = struct{}{}
-		res[ys+word] = struct{}{}
+		ys := strconv.Itoa(y)
+		add(word + ys)
+		add(ys + word)
 		// Short year
 		if len(ys) >= 4 {
 			sys := ys[2:]
-			res[word+sys] = struct{}{}
-			res[sys+word] = struct{}{}
+			add(word + sys)
+			add(sys + word)
 		}
 	}
 
 	// 123 variations
 	seqs := []string{"1", "12", "123", "1234", "12345", "123456", "0", "01", "012"}
 	for _, s := range seqs {
-		res[word+s] = struct{}{}
-		res[s+word] = struct{}{}
+		add(word + s)
+		add(s + word)
 	}
 
 	// Common symbols
 	syms := []string{"!", ".", "?", "*", "#", "@", "$"}
 	for _, s := range syms {
-		res[word+s] = struct{}{}
-		res[s+word] = struct{}{}
+		add(word + s)
+		add(s + word)
 	}
 }
 
@@ -1689,36 +2111,22 @@ func generateToggleVariations(word string) []string {
 
 	// Toggle first char
 	runes := []rune(word)
-	if len(runes) > 0 {
-		r0 := runes[0]
-		if r0 >= 'a' && r0 <= 'z' {
-			runes[0] = r0 - 32
-		} else if r0 >= 'A' && r0 <= 'Z' {
-			runes[0] = r0 + 32
-		}
-		res = append(res, string(runes))
-	}
+	runes[0] = toggleRuneCase(runes[0])
+	res = append(res, string(runes))
 
 	// Toggle last char
 	runes = []rune(word)
-	if len(runes) > 0 {
-		last := len(runes) - 1
-		rl := runes[last]
-		if rl >= 'a' && rl <= 'z' {
-			runes[last] = rl - 32
-		} else if rl >= 'A' && rl <= 'Z' {
-			runes[last] = rl + 32
-		}
-		res = append(res, string(runes))
-	}
+	last := len(runes) - 1
+	runes[last] = toggleRuneCase(runes[last])
+	res = append(res, string(runes))
 
 	// Alternating case 1: aBcD
 	runes = []rune(word)
 	for i := range runes {
 		if i%2 == 0 {
-			runes[i] = []rune(strings.ToLower(string(runes[i])))[0]
+			runes[i] = unicode.ToLower(runes[i])
 		} else {
-			runes[i] = []rune(strings.ToUpper(string(runes[i])))[0]
+			runes[i] = unicode.ToUpper(runes[i])
 		}
 	}
 	res = append(res, string(runes))
@@ -1727,12 +2135,23 @@ func generateToggleVariations(word string) []string {
 	runes = []rune(word)
 	for i := range runes {
 		if i%2 != 0 {
-			runes[i] = []rune(strings.ToLower(string(runes[i])))[0]
+			runes[i] = unicode.ToLower(runes[i])
 		} else {
-			runes[i] = []rune(strings.ToUpper(string(runes[i])))[0]
+			runes[i] = unicode.ToUpper(runes[i])
 		}
 	}
 	res = append(res, string(runes))
 
 	return res
+}
+
+func toggleRuneCase(r rune) rune {
+	switch {
+	case unicode.IsLower(r):
+		return unicode.ToUpper(r)
+	case unicode.IsUpper(r):
+		return unicode.ToLower(r)
+	default:
+		return r
+	}
 }

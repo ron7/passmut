@@ -3,17 +3,23 @@
 # Binary name
 BINARY_NAME=passmut
 
+# Version baked into the binary. Defaults to the nearest git tag so a local
+# build reports a real version instead of a stale hardcoded constant.
+# Override with: make build VERSION=1.2.3
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo dev)
+LDFLAGS = -s -w -X main.version=$(VERSION)
+
 # Build the binary (production - optimized and stripped)
 build:
-	CGO_ENABLED=0 go build -ldflags="-s -w" -o $(BINARY_NAME) main.go
+	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BINARY_NAME) main.go
 
 # Build with optimizations for production
 build-dev:
-	go build -o $(BINARY_NAME) main.go
+	go build -ldflags="$(LDFLAGS)" -o $(BINARY_NAME) main.go
 
 # Install the binary to GOPATH/bin
 install:
-	go install
+	go install -ldflags="$(LDFLAGS)"
 
 # Clean build artifacts
 clean:
@@ -50,14 +56,14 @@ all: fmt vet test build
 
 # Cross-compilation targets
 build-linux:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(BINARY_NAME)-linux-amd64 main.go
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(BINARY_NAME)-linux-amd64 main.go
 
 build-windows:
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o $(BINARY_NAME)-windows-amd64.exe main.go
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(BINARY_NAME)-windows-amd64.exe main.go
 
 build-darwin:
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o $(BINARY_NAME)-darwin-amd64 main.go
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o $(BINARY_NAME)-darwin-arm64 main.go
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(BINARY_NAME)-darwin-amd64 main.go
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o $(BINARY_NAME)-darwin-arm64 main.go
 
 # Build for all platforms
 build-all: build-linux build-windows build-darwin
