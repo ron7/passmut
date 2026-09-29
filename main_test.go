@@ -19,7 +19,6 @@ func createTestMangler(cfg *Config) (*Mangler, *bytes.Buffer) {
 	var buf bytes.Buffer
 	m := &Mangler{
 		config:           cfg,
-		seenHashes:       make(map[uint64]struct{}),
 		blacklistedWords: make(map[string]struct{}),
 		bufWriter:        bufio.NewWriter(&buf),
 	}
@@ -428,6 +427,88 @@ func TestNoDedupEmitsDuplicates(t *testing.T) {
 	got := getResults(m, buf)
 	if len(got) != 2 {
 		t.Fatalf("--no-dedup should emit 2 lines, got %d: %v", len(got), got)
+	}
+}
+
+// TestConcurrentOutputMatchesSingleThreaded guards the worker-pool/sink rewrite:
+// the set of emitted words must not depend on the number of goroutines.
+func TestConcurrentOutputMatchesSingleThreaded(t *testing.T) {
+	words := make([]string, 300)
+	for i := range words {
+		words[i] = fmt.Sprintf("Word%03d!", i)
+	}
+
+	run := func(cfg *Config) []string {
+		var buf bytes.Buffer
+		m := &Mangler{config: cfg, bufWriter: bufio.NewWriter(&buf)}
+		if err := m.process(words); err != nil {
+			t.Fatal(err)
+		}
+		m.bufWriter.Flush()
+		out := strings.Split(strings.TrimSpace(buf.String()), "\n")
+		sort.Strings(out)
+		return out
+	}
+
+	cases := map[string]*Config{
+		"stream":     {leet: true, capital: true, reverse: true},
+		"sort-alpha": {leet: true, capital: true, sortMode: "a"},
+		"sort-effic": {leet: true, capital: true, sortMode: "e"},
+		"level2":     {leet: true, capital: true, mutationLevel: 2},
+	}
+	for name, base := range cases {
+		t.Run(name, func(t *testing.T) {
+			single := *base
+			single.threads = 1
+			multi := *base
+			multi.threads = 8
+
+			a, b := run(&single), run(&multi)
+			if len(a) != len(b) {
+				t.Fatalf("thread count changed output size: %d vs %d", len(a), len(b))
+			}
+			for i := range a {
+				if a[i] != b[i] {
+					t.Fatalf("mismatch at %d: %q vs %q", i, a[i], b[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSinkFlushesLargeOutput makes sure buffered worker output is not lost when
+// it exceeds the internal flush threshold.
+func TestSinkFlushesLargeOutput(t *testing.T) {
+	const n = 50000
+	words := make([]string, n)
+	for i := range words {
+		words[i] = fmt.Sprintf("w%06d", i)
+	}
+	// leet on "w000000" yields exactly two unique results (w.../v...), so the
+	// output is large enough to force many sink flushes.
+	var buf bytes.Buffer
+	m := &Mangler{config: &Config{threads: 8, leet: true}, bufWriter: bufio.NewWriter(&buf)}
+	if err := m.process(words); err != nil {
+		t.Fatal(err)
+	}
+	m.bufWriter.Flush()
+	got := strings.Count(strings.TrimSpace(buf.String()), "\n") + 1
+	if got != 2*n {
+		t.Fatalf("expected %d lines, got %d", 2*n, got)
+	}
+}
+
+func TestDedupMaskFor(t *testing.T) {
+	cases := []struct {
+		threads int
+		want    uint64
+	}{
+		{0, 3}, {1, 3}, {2, 7}, {8, 31}, {22, 127}, {1000, 255},
+	}
+	for _, c := range cases {
+		if got := dedupMaskFor(c.threads); got != c.want {
+			t.Errorf("dedupMaskFor(%d) = %d; want %d", c.threads, got, c.want)
+		}
 	}
 }
 

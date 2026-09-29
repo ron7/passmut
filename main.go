@@ -158,9 +158,49 @@ type substitution struct {
 }
 
 // Mangler handles the word mangling operations
+// dedupShards is the maximum number of dedup shards (must be a power of two).
+// Sharding keeps concurrent workers from serializing on a single mutex; the
+// active count scales with the worker count (see dedupMaskFor) so that
+// single-threaded runs do not pay for hundreds of tiny maps.
+const dedupShards = 256
+
+type dedupShard struct {
+	mu sync.Mutex
+	m  map[uint64]struct{}
+}
+
+// sink buffers one worker's output locally and flushes it into the shared
+// buffered writer in large chunks. This keeps the per-word commit path off the
+// global lock, which previously made --threads slower than a single thread.
+type sink struct {
+	m   *Mangler
+	buf []byte
+}
+
+const sinkFlushSize = 32 * 1024
+
+func (s *sink) write(word string) {
+	s.buf = append(s.buf, word...)
+	s.buf = append(s.buf, '\n')
+	if len(s.buf) >= sinkFlushSize {
+		s.flush()
+	}
+}
+
+func (s *sink) flush() {
+	if len(s.buf) == 0 {
+		return
+	}
+	s.m.mu.Lock()
+	s.m.bufWriter.Write(s.buf)
+	s.m.mu.Unlock()
+	s.buf = s.buf[:0]
+}
+
 type Mangler struct {
 	config           *Config
-	seenHashes       map[uint64]struct{}
+	seenShards       [dedupShards]dedupShard
+	dedupMask        uint64 // len(seenShards)-1 in use; 0 means a single shard
 	collectedResults []string
 	blacklistedWords map[string]struct{}
 	currentCommon    []string
@@ -990,13 +1030,13 @@ func run(config *Config, inputPaths []string) error {
 
 	mangler := &Mangler{
 		config:           config,
-		seenHashes:       make(map[uint64]struct{}),
 		blacklistedWords: blacklist,
 		currentCommon:    commonSet,
 		bufWriter:        bufio.NewWriterSize(output, 64*1024),
 		prefixList:       splitComma(config.prefixStrings),
 		suffixList:       splitComma(config.suffixStrings),
 		ruleList:         splitComma(config.rulesList),
+		dedupMask:        dedupMaskFor(config.threads),
 	}
 
 	defer mangler.bufWriter.Flush()
@@ -1077,38 +1117,57 @@ func (m *Mangler) process(words []string) error {
 		m.config.sortMode = "INTERNAL_POOL" // Temporal mode to bypass filters in writeWord
 	}
 
-	// Multithreaded worker loop
-	jobs := make(chan string, 100)
-	var wg sync.WaitGroup
+	if !m.hasTransformations() && m.config.rulesList == "" && m.config.mutationLevel < 2 {
+		// No per-word CPU work to parallelize: running through the worker pool
+		// only adds goroutine/channel overhead and is measurably slower for
+		// plain pass-through.
+		var s *sink
+		if m.config.sortMode == "" {
+			s = &sink{m: m, buf: make([]byte, 0, sinkFlushSize)}
+			defer s.flush()
+		}
+		for _, word := range wordlist {
+			m.writeWordTo(word, s)
+		}
+	} else {
+		// Multithreaded worker loop
+		jobs := make(chan string, 1024)
+		var wg sync.WaitGroup
 
-	worker := func() {
-		defer wg.Done()
-		for word := range jobs {
-			if m.config.mutationLevel >= 2 {
-				m.chainMangle(word)
-			} else {
-				m.mangleWord(word)
+		worker := func() {
+			defer wg.Done()
+			s := &sink{m: m, buf: make([]byte, 0, sinkFlushSize)}
+			defer s.flush()
+			for word := range jobs {
+				if m.config.mutationLevel >= 2 {
+					m.chainMangleTo(word, s)
+				} else {
+					m.mangleWordTo(word, s)
+				}
 			}
 		}
-	}
 
-	// Start workers
-	threadCount := m.config.threads
-	if threadCount < 1 {
-		threadCount = 1
-	}
+		// Start workers (no point having more workers than words)
+		threadCount := m.config.threads
+		if threadCount < 1 {
+			threadCount = 1
+		}
+		if len(wordlist) > 0 && threadCount > len(wordlist) {
+			threadCount = len(wordlist)
+		}
 
-	for i := 0; i < threadCount; i++ {
-		wg.Add(1)
-		go worker()
-	}
+		for i := 0; i < threadCount; i++ {
+			wg.Add(1)
+			go worker()
+		}
 
-	// Feed words
-	for _, word := range wordlist {
-		jobs <- word
+		// Feed words
+		for _, word := range wordlist {
+			jobs <- word
+		}
+		close(jobs)
+		wg.Wait()
 	}
-	close(jobs)
-	wg.Wait()
 
 	// Now we have a pool of mangled components in m.collectedResults (if isPP)
 	if isPP {
@@ -1206,32 +1265,36 @@ func (m *Mangler) exhaustivePP(pool []string, rem int, cur []string) {
 // itself re-mangled and only the second-round results are emitted. Unlike the
 // previous implementation it keeps all state local to the call, so it no
 // longer races on the shared config/collection when run from many goroutines.
-func (m *Mangler) chainMangle(word string) {
+func (m *Mangler) chainMangle(word string) { m.chainMangleTo(word, nil) }
+
+func (m *Mangler) chainMangleTo(word string, s *sink) {
 	if m.config.rulesList != "" {
 		// A recipe already describes the full transformation sequence;
 		// there is nothing meaningful to chain on top of it.
-		m.applySequence(word)
+		m.applySequenceTo(word, s)
 		return
 	}
 	for _, w := range m.generateVariations(word) {
 		for _, v := range m.generateVariations(w) {
-			m.writeWord(v)
+			m.writeWordTo(v, s)
 		}
 	}
 }
 
-func (m *Mangler) mangleWord(word string) {
+func (m *Mangler) mangleWord(word string) { m.mangleWordTo(word, nil) }
+
+func (m *Mangler) mangleWordTo(word string, s *sink) {
 	if m.config.rulesList != "" {
-		m.applySequence(word)
+		m.applySequenceTo(word, s)
 		return
 	}
 	// Plain pass-through needs no variation slice at all.
 	if !m.hasTransformations() {
-		m.writeWord(word)
+		m.writeWordTo(word, s)
 		return
 	}
 	for _, w := range m.generateVariations(word) {
-		m.writeWord(w)
+		m.writeWordTo(w, s)
 	}
 }
 
@@ -1390,7 +1453,9 @@ func leetSwap(word string) string {
 	return b.String()
 }
 
-func (m *Mangler) applySequence(word string) {
+func (m *Mangler) applySequence(word string) { m.applySequenceTo(word, nil) }
+
+func (m *Mangler) applySequenceTo(word string, s *sink) {
 	rules := m.ruleList
 	if rules == nil {
 		rules = splitComma(m.config.rulesList)
@@ -1431,11 +1496,13 @@ func (m *Mangler) applySequence(word string) {
 	}
 
 	for _, w := range current {
-		m.writeWord(w)
+		m.writeWordTo(w, s)
 	}
 }
 
-func (m *Mangler) writeWord(word string) {
+func (m *Mangler) writeWord(word string) { m.writeWordTo(word, nil) }
+
+func (m *Mangler) writeWordTo(word string, s *sink) {
 	if m.config.minLength > 0 && len(word) < m.config.minLength {
 		return
 	}
@@ -1476,15 +1543,13 @@ func (m *Mangler) writeWord(word string) {
 		}
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// If we are building an internal pool, we bypass all final filters
+	// If we are building an internal pool, we bypass dedup and final filters
 	if strings.HasPrefix(m.config.sortMode, "INTERNAL") {
-		if m.resultBufferFull() {
-			return
+		m.mu.Lock()
+		if !m.resultBufferFull() {
+			m.collectedResults = append(m.collectedResults, word)
 		}
-		m.collectedResults = append(m.collectedResults, word)
+		m.mu.Unlock()
 		return
 	}
 
@@ -1493,25 +1558,59 @@ func (m *Mangler) writeWord(word string) {
 	// silently drops legitimate distinct results; 64 bits makes accidental
 	// collisions negligible without paying for an exact string set. --no-dedup
 	// skips this entirely for very large runs where the set would be too big.
-	if !m.config.noDedup {
-		if m.seenHashes == nil {
-			m.seenHashes = make(map[uint64]struct{})
-		}
-		h := fnv1a64(word)
-		if _, exists := m.seenHashes[h]; exists {
-			return
-		}
-		m.seenHashes[h] = struct{}{}
-	}
-	if m.config.sortMode != "" {
-		if m.resultBufferFull() {
-			return
-		}
-		m.collectedResults = append(m.collectedResults, word)
+	if !m.config.noDedup && !m.markSeen(word) {
 		return
 	}
+	if m.config.sortMode != "" {
+		m.mu.Lock()
+		if !m.resultBufferFull() {
+			m.collectedResults = append(m.collectedResults, word)
+		}
+		m.mu.Unlock()
+		return
+	}
+	if s != nil {
+		s.write(word)
+		return
+	}
+	m.mu.Lock()
 	m.bufWriter.WriteString(word)
 	m.bufWriter.WriteByte('\n')
+	m.mu.Unlock()
+}
+
+// dedupMaskFor returns a shard mask sized to the worker count: enough shards to
+// avoid contention, but as few as possible to keep the maps cache-friendly.
+func dedupMaskFor(threads int) uint64 {
+	if threads < 1 {
+		threads = 1
+	}
+	n := threads * 4
+	if n > dedupShards {
+		n = dedupShards
+	}
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return uint64(p - 1)
+}
+
+// markSeen reports whether word is new (true) or a duplicate (false). It is
+// sharded so concurrent workers rarely contend on the same mutex.
+func (m *Mangler) markSeen(word string) bool {
+	h := fnv1a64(word)
+	sh := &m.seenShards[h&m.dedupMask]
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.m == nil {
+		sh.m = make(map[uint64]struct{})
+	}
+	if _, exists := sh.m[h]; exists {
+		return false
+	}
+	sh.m[h] = struct{}{}
+	return true
 }
 
 // resultBufferFull reports whether the in-memory result buffer has reached
